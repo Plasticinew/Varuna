@@ -1,0 +1,22 @@
+# bond mode 1
+network:
+  version: 2
+  ethernets:
+    ens1f0:
+      dhcp4: no
+      addresses: [10.10.1.2/24]
+    ens1f1:
+      dhcp4: no
+      addresses: [10.10.1.3/24]
+  renderer: networkd
+  bonds:
+    bond0:
+      interfaces:
+        - ens1f0
+        - ens1f1
+      addresses: [10.10.1.6/24]
+      parameters:
+        mode: active-backup
+        primary: ens1f0
+        mii-monitor-interval: 100
+      

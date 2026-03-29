@@ -1,0 +1,7 @@
+{
+    "node_id": 0,
+    "eth_names": ["bond0"],
+    "mlx_names": ["mlx5_bond_0"],
+    "ports": ["1145"],
+    "ips": ["10.10.1.20"]
+}
