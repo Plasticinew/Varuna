@@ -172,7 +172,6 @@ void test_zQP_shared_p2p(string config_file, string remote_config_file, int thre
     {
         zQP *qp = zQP_create(pd, ep, table, ZQP_ONESIDED);
         zQP_connect(qp, 0, config.target_ips[0], config.target_ports[0]);
-        zQP_connect(qp, 1, qp->m_targets[1]->ip, qp->m_targets[1]->port);
         qps.push_back(qp);
         counter_vec.push_back(&qp->size_counter_);
     }
