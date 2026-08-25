@@ -9,11 +9,14 @@ int main(int argc, char** argv) {
     string config_file = argv[1];
     zEndpoint *ep = zEP_create(config_file);
     zPD *pd = zPD_create(ep, 1);
-    rkeyTable *table = new rkeyTable();
     zQP_listener *qp = zQP_listener_create(pd, ep);
-    std::thread listener_1 = std::thread(&zQP_listen, qp, 0, std::ref(ep->m_devices[0]->eth_ip), std::ref(ep->m_devices[0]->port));
-    std::thread listener_2 = std::thread(&zQP_listen, qp, 1, std::ref(ep->m_devices[1]->eth_ip), std::ref(ep->m_devices[1]->port));
-    listener_1.join();
-    listener_2.join();
+    std::vector<std::thread*> listeners;
+    for (int i = 0; i < ep->m_device_num; i++) {
+        listeners.push_back(new std::thread(&zQP_listen, qp, i,
+            std::ref(ep->m_devices[i]->eth_ip), std::ref(ep->m_devices[i]->port)));
+    }
+    for (auto *t : listeners) {
+        t->join();
+    }
     return 0;
 }

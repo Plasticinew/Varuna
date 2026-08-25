@@ -14,8 +14,7 @@ static int modify_qp_to_init(struct ibv_qp * qp, const struct QpInfo * local_qp_
         IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
     attr_mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
     rc = ibv_modify_qp(qp, &attr, attr_mask);
-    // assert(rc == 0);
-    return 0;
+    return rc;
 }
 
 static int modify_qp_to_rtr(struct ibv_qp * local_qp, 
@@ -47,8 +46,7 @@ static int modify_qp_to_rtr(struct ibv_qp * local_qp,
     attr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                 IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
     rc = ibv_modify_qp(local_qp, &attr, attr_mask);
-    // assert(rc == 0);
-    return 0;
+    return rc;
 }
 
 static int modify_qp_to_rts(struct ibv_qp * local_qp) {
@@ -65,8 +63,7 @@ static int modify_qp_to_rts(struct ibv_qp * local_qp) {
     attr_mask = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                 IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
     rc = ibv_modify_qp(local_qp, &attr, attr_mask);
-    // assert(rc == 0);
-    return 0;
+    return rc;
 }
 
 struct ibv_context * ib_get_ctx(uint32_t dev_id, uint32_t port_id) {
@@ -95,19 +92,21 @@ int ib_connect_qp(struct ibv_qp * local_qp,
     uint8_t conn_type, bool server) {
     int rc = 0;
     rc = modify_qp_to_init(local_qp, local_qp_info);
-    // assert(rc == 0);
+    if (rc != 0) {
+        return rc;
+    }
 
     rc = modify_qp_to_rtr(local_qp, local_qp_info, remote_qp_info, conn_type);
-    // assert(rc == 0);
+    if (rc != 0) {
+        return rc;
+    }
 
     if (server) {
         return 0;
     }
     
-    // assert(!server);
     rc = modify_qp_to_rts(local_qp);
-    // assert(rc == 0);
-    return 0;
+    return rc;
 }
 
 }

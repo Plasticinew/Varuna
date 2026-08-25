@@ -13,7 +13,11 @@ std::atomic<uint64_t> global_counter{0};
 std::atomic<uint64_t> global_latency{0};
 double bandwidth[16];
 double recovery_latency[16];
+string g_fault_ifname;
+string g_backup_ifname;
+string g_fault_cidr;
 // #define SIMPLE_TEST
+// #define PRECONNECT_BACKUP
 
 enum TestType
 {
@@ -36,9 +40,18 @@ void nic_shutdown_handler()
 {
     // usleep(rand() % 500000 + 500000);
     usleep(3000000);
-    system("sudo ip link set ens1f0 down");
-    printf("ens1f0 down\n");
-    // system("sudo ifconfig ens3f0 down");
+    if (g_fault_ifname.empty())
+    {
+        return;
+    }
+    const char *v = getenv("VARUNA_INJECT_FAULT");
+    if (v != NULL && v[0] == '0')
+    {
+        return;
+    }
+    string cmd = string("sudo ip link set ") + g_fault_ifname + " down";
+    system(cmd.c_str());
+    printf("%s down\n", g_fault_ifname.c_str());
 }
 
 void bandwidth_counting_thread(tbb::concurrent_vector<std::atomic<uint64_t> *> &counter_vec)
@@ -172,7 +185,9 @@ void test_zQP_shared_p2p(string config_file, string remote_config_file, int thre
     {
         zQP *qp = zQP_create(pd, ep, table, ZQP_ONESIDED);
         zQP_connect(qp, 0, config.target_ips[0], config.target_ports[0]);
+#ifdef PRECONNECT_BACKUP
         zQP_connect(qp, 1, qp->m_targets[1]->ip, qp->m_targets[1]->port);
+#endif
         qps.push_back(qp);
         counter_vec.push_back(&qp->size_counter_);
     }
@@ -1008,15 +1023,30 @@ void test_zQP_shared(string config_file, string remote_config_file, int thread_i
     printf("Test completed successfully\n");
 }
 
+static void restore_links()
+{
+    if (!g_fault_ifname.empty())
+    {
+        string cmd = string("sudo ip link set ") + g_fault_ifname + " up";
+        system(cmd.c_str());
+        if (!g_fault_cidr.empty())
+        {
+            string ip_cmd = string("sudo ifconfig ") + g_fault_ifname + " " + g_fault_cidr;
+            system(ip_cmd.c_str());
+        }
+    }
+    if (!g_backup_ifname.empty())
+    {
+        string cmd = string("sudo ip link set ") + g_backup_ifname + " up";
+        system(cmd.c_str());
+    }
+}
+
 int main(int argc, char **argv)
 {
     std::ofstream log_file("bandwidth_log.txt");
     std::ofstream result_file("result.txt", std::ios::app);
     log_file.close();
-    system("sudo ip link set ens1f0 up");
-    system("sudo ifconfig ens1f0 10.10.1.1/24");
-    system("sudo ip link set ens1f1 up");
-    sleep(2);
     if (argc < 7)
     {
         printf("Usage: %s <local_config_file> <remote_config_file> <thread_num> <test_type> <size> <batch>\n", argv[0]);
@@ -1029,6 +1059,17 @@ int main(int argc, char **argv)
     string test_type = argv[4];
     int size = atoi(argv[5]);
     batch_number = atoi(argv[6]);
+    zDeviceConfig local_cfg;
+    if (load_config(config_file.c_str(), &local_cfg) != 0 || local_cfg.num_devices < 1)
+    {
+        printf("Failed to load local config %s\n", config_file.c_str());
+        return -1;
+    }
+    g_fault_ifname = local_cfg.eth_names[0];
+    g_backup_ifname = local_cfg.num_devices > 1 ? local_cfg.eth_names[1] : local_cfg.eth_names[0];
+    g_fault_cidr = local_cfg.ips[0] + "/24";
+    restore_links();
+    sleep(2);
     TestType test_type_enum;
     if (test_type == "read_sync")
     {
@@ -1110,9 +1151,7 @@ int main(int argc, char **argv)
         {
             threads[i]->join();
         }
-        system("sudo ip link set ens1f0 up");
-        system("sudo ifconfig ens1f0 10.10.1.1/24");
-        system("sudo ip link set ens1f1 up");
+        restore_links();
         threads.clear();
         sleep(2);
         // printf("%lf\n", global_counter.load()/(thread_num*1.0));

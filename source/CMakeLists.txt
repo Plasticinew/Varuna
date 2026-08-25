@@ -15,6 +15,9 @@ target_link_libraries(zClient zQP )
 add_executable(latency_test latency_test.cc)
 target_link_libraries(latency_test zQP )
 
+add_executable(bw_timeline bw_timeline.cc)
+target_link_libraries(bw_timeline zQP )
+
 install(TARGETS zQP
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib

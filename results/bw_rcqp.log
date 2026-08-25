@@ -1,0 +1,31 @@
+DCT mlx5_0 gid_index=3 gid=0000000000000000:01010a0affff0000 dct_num=7873
+DCT mlx5_1 gid_index=3 gid=0000000000000000:01020a0affff0000 dct_num=7237
+QP connect nic=0 dst=10.10.1.2:1145 private_data_len=196 pdata=160 nic_num=2
+  target[0] ip=10.10.1.2 port=1145 dct=5173 lid=0 ah=0x5616b9158dd0
+  target[1] ip=10.10.2.2 port=1146 dct=7197 lid=0 ah=0x5616b9158ee0
+QP connect nic=0 dst=10.10.1.2:1145 private_data_len=196 pdata=160 nic_num=2
+  target[0] ip=10.10.1.2 port=1145 dct=5173 lid=0 ah=0x5616b912e1e0
+  target[1] ip=10.10.2.2 port=1146 dct=7197 lid=0 ah=0x5616b912e2f0
+bw_timeline mode=rcqp io_size=65536 depth=16 sample_us=1000 warmup_ms=400 out=./results/bw_rcqp.csv
+EVENT t_ns=1787661038458418665 name=link_down device=0
+CQ error status=12 wr_id=7f148d54a9384990 device=0
+CQ error status=5 wr_id=7f148d54a9384990 device=0
+CQ error status=5 wr_id=7f148d54a9b84991 device=0
+CQ error status=5 wr_id=7f148d54a9b84991 device=0
+CQ error status=5 wr_id=7f148d54aa384992 device=0
+CQ error status=5 wr_id=7f148d54aa384992 device=0
+CQ error status=5 wr_id=7f148d54aab84993 device=0
+CQ error status=5 wr_id=7f148d54aab84993 device=0
+Start switch on device 0 at time 1787661042326081179
+EVENT t_ns=1787661042326086680 name=switch_start device=0
+Connecting backup path nic=1 dst=10.10.2.2:1146
+EVENT t_ns=1787661042326091620 name=rc_connect_begin device=1
+Injected link down on ens3f0 at t_us=5473553
+QP connect nic=1 dst=10.10.2.2:1146 private_data_len=196 pdata=160 nic_num=2
+  target[0] ip=10.10.1.2 port=1145 dct=5173 lid=0 ah=0x5616b9158dd0
+  target[1] ip=10.10.2.2 port=1146 dct=7197 lid=0 ah=0x5616b9158ee0
+EVENT t_ns=1787661043548139179 name=rc_ready device=1
+Switched to device 1 requestor_ready=1 dcqp=0
+Finish recovery 1 at time 1787661043548349206
+bw_timeline observed rc_ready t_us=5490174 device=1
+bw_timeline done samples=6596 link_down_us=5473553 first_dcqp_us=0 rc_ready_us=5490174 out=./results/bw_rcqp.csv

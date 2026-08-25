@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdarg>
+#include <cstring>
 #include <unordered_map>
 #include <chrono>
 #include <iostream>
@@ -223,9 +224,10 @@ namespace zrdma
         ibv_cq *cq_;
         zStatus status_;
         uint8_t port_num_;
+        uint8_t gid_index_;
         uint16_t lid_;
         uint32_t dct_num_;
-        // atomic<uint64_t> size_counter_{0};
+        std::mutex lock;
     };
 
     struct zDCQP_responder
@@ -241,6 +243,7 @@ namespace zrdma
         zStatus status_;
         uint64_t gid1, gid2, interface, subnet;
         uint8_t port_num_;
+        uint8_t gid_index_;
         uint16_t lid_;
         uint32_t dct_num_;
     };
@@ -340,6 +343,76 @@ namespace zrdma
 
     typedef unordered_map<uint32_t, vector<uint32_t>> rkeyTable;
 
+    inline uint64_t pack_wr_header(uint64_t wr_addr, uint16_t time_stamp, uint8_t finished)
+    {
+        zWR_header header{};
+        header.time_stamp = time_stamp;
+        header.finished = finished;
+        header.wr_addr = wr_addr;
+        uint64_t packed = 0;
+        memcpy(&packed, &header, sizeof(packed));
+        return packed;
+    }
+
+    inline int prev_device_index(int current, int device_num)
+    {
+        if (device_num <= 0)
+        {
+            return 0;
+        }
+        return (current + device_num - 1) % device_num;
+    }
+
+    inline uint32_t translate_lkey(zPD *pd, uint32_t lkey, int device_id)
+    {
+        if (pd == nullptr || device_id < 0)
+        {
+            return lkey;
+        }
+        tbb::concurrent_hash_map<uint32_t, tbb::concurrent_vector<uint32_t>>::const_accessor a;
+        if (pd->m_lkey_table.find(a, lkey) && device_id < (int)a->second.size())
+        {
+            return a->second[device_id];
+        }
+        for (auto it = pd->m_lkey_table.begin(); it != pd->m_lkey_table.end(); ++it)
+        {
+            const auto &keys = it->second;
+            for (size_t i = 0; i < keys.size(); i++)
+            {
+                if (keys[i] == lkey && device_id < (int)keys.size())
+                {
+                    return keys[device_id];
+                }
+            }
+        }
+        return lkey;
+    }
+
+    inline uint32_t translate_rkey(rkeyTable *table, uint32_t rkey, int device_id)
+    {
+        if (table == nullptr || device_id < 0)
+        {
+            return rkey;
+        }
+        auto it = table->find(rkey);
+        if (it != table->end() && device_id < (int)it->second.size())
+        {
+            return it->second[device_id];
+        }
+        for (auto t = table->begin(); t != table->end(); ++t)
+        {
+            const auto &keys = t->second;
+            for (size_t i = 0; i < keys.size(); i++)
+            {
+                if (keys[i] == rkey && device_id < (int)keys.size())
+                {
+                    return keys[device_id];
+                }
+            }
+        }
+        return rkey;
+    }
+
     struct cq_info
     {
         ibv_wc_status status;
@@ -377,6 +450,7 @@ namespace zrdma
         // struct ibv_mr* qp_log_list_[MAX_QP_NUM];
         qp_info_table *qp_info;
         uint32_t qp_info_rkey[MAX_NIC_NUM];
+        std::atomic<bool> stop{false};
         thread *flush_thread_;
     };
 
@@ -402,8 +476,10 @@ namespace zrdma
         ibv_sge sge_[WR_ENTRY_NUM];
         ibv_sge sge_backup[WR_ENTRY_NUM];
         zAtomic_buffer atomic_buffer_[WR_ENTRY_NUM];
-        int entry_start_ = 0;
+        std::atomic<int> entry_start_{0};
         std::atomic<int> entry_end_{0};
+        std::atomic<bool> in_recovery{false};
+        std::mutex recovery_mutex;
         std::atomic<uint64_t> size_counter_{0};
         zQPType qp_type;
         int qp_id_ = 0;
@@ -429,7 +505,7 @@ namespace zrdma
 
     zDCQP_responder *zDCQP_create_responder(zDevice *device, ibv_pd *pd);
     zQP_listener *zQP_listener_create(zPD *pd, zEndpoint *ep);
-    void zQP_flush(qp_info_table *qp_info);
+    void zQP_flush(zQP_listener *listener);
     int zQP_listen(zQP_listener *zqp, int nic_index, string ip, string port);
     int zQP_accept(zQP_listener *zqp, int nic_index, rdma_cm_id *cm_id, zQPType qp_type, int node_id);
     void zQP_worker(zPD *pd, zQP_responder *qp_instance, WorkerInfo *work_info, uint32_t num);

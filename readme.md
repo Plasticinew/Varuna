@@ -294,10 +294,10 @@ pprof --text ./build/source/latency_test latency_test.prof
 
 ## 注意事项
 
-- `zClient` 和 `latency_test` 会通过 `sudo` 执行 `ip link`/`ifconfig`，并硬编码操作 `ens1f0`、`ens1f1` 和 `10.10.1.1/24`。
-- 两个测试程序都会主动关闭 `ens1f0` 来模拟链路故障；直接运行可能中断当前机器网络连接。
+- `zClient` 和 `latency_test` 会通过 `sudo` 执行 `ip link`/`ifconfig`，网卡名和 IP 来自本地 JSON 配置中的 `eth_names` 与 `ips`。
+- 两个测试程序都会主动关闭配置中的第一块网卡来模拟链路故障；直接运行可能中断当前机器网络连接。
 - 在实际环境运行前，应先修改 `source/zClient.cc` 与 `source/latency_test.cc` 中的网卡控制逻辑，或移除故障注入代码。
-- 论文描述的是 DCQP 立即接管、RCQP 后台异步重建的完整设计；当前 `source/zQP.cc` 默认未启用 `ASYNC_CONNECT`，而 `latency_test` 还会预连接第二条 RCQP 路径，因此默认实验路径与论文架构并不完全相同。
+- 论文描述的是 DCQP 立即接管、RCQP 后台异步重建的完整设计；默认已启用 `ASYNC_CONNECT`。若要复现预连接备用 RCQP 的 Resend-cache 基线，请在 `latency_test` 中定义 `PRECONNECT_BACKUP`。
 - 论文描述了固件/驱动事件、CQ error 和 heartbeat 等组合式故障检测；当前代码主要依赖 completion error、超时和测试程序中的手动断链，没有实现完整的可配置 heartbeat 子系统。
 - 论文中的 Motor/TPC-C 集成、应用层评估代码以及部分 baseline 不在当前仓库内。
 - 配置解析失败目前没有完善的错误报告，错误的 JSON、数组长度不一致或不存在的 RDMA 设备可能导致断言失败或进程退出。
