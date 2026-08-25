@@ -1,0 +1,53 @@
+schema: spec-driven
+
+context: |
+  Language: zh
+  本仓库是 Varuna（RDMA failover 运行时）。非平凡改动先走 OpenSpec：proposal → specs → design → tasks，再改代码。
+  所有 OpenSpec 产物用中文撰写，方便阅读；结构标题（Why / Requirement / Scenario）和 SHALL/MUST 保留英文。
+  实现时以 specs 为准，不要把 CQ 当持久日志，也不要在恢复路径上现场倒对端 CQ。
+
+rules:
+  proposal:
+    - 用中文写动机、范围和非目标，控制在 500 字以内
+    - 必须包含「不做什么」，避免把 CAS、DCQP IMM、mlx5 裸 CQ 一并塞进来
+  specs:
+    - 需求与 Given/When/Then 场景用中文
+    - 每个 SHALL/MUST 都要有可判定的 Scenario
+    - 写清稳态 worker、RQ 补货、恢复仍 RDMA-read log 这三条硬约束
+  design:
+    - 用中文记录关键决策、备选方案和取舍
+    - 明确 imm 编码、RQ/CQ 深度、以及哪些路径（sync/async/post_send）要改
+  tasks:
+    - 任务描述用中文；勾选格式必须是 `- [ ]` / `- [x]`
+    - 按「数据结构 → 客户端 → 服务端 → 恢复/编译」分组，避免一项里改完整个运行时
+
+operations:
+  apply:
+    guidance:
+      - 先完成 tasks.md 里当前未勾选项，再扩范围
+      - 不要引入「恢复时再 poll 对端 CQ」或 ignore-overrun 裸读 CQE ring
+  archive:
+    guidance:
+      - 归档前用中文简述：IMM 是否已替换 log WRITE、worker 是否补 RQ、恢复是否仍读内存 log
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing

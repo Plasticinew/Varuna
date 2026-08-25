@@ -205,6 +205,8 @@ namespace zrdma
 #define WR_ENTRY_NUM 1024
 #define MAX_QP_NUM 1024
 #define ATOMIC_ENTRY_NUM 512
+#define IMM_RECV_DEPTH 512
+#define IMM_CQ_SIZE 2048
 
     inline void z_debug(const char *fmt, ...)
     {
@@ -294,6 +296,25 @@ namespace zrdma
         uint64_t target_addr : 48;
     };
 
+    // Remote layout at server_cmd_msg_ / qp_info[id].addr:
+    //   [0, WR_ENTRY_NUM)              write IMM completion log (zWR_entry)
+    //   [WR_ENTRY_NUM, 2*WR_ENTRY_NUM) CAS extended-status buffer (zAtomic_buffer)
+    inline size_t write_log_region_bytes()
+    {
+        return (size_t)WR_ENTRY_NUM * sizeof(zWR_entry);
+    }
+
+    inline uint64_t cas_buffer_remote_addr(uint64_t log_base, int slot)
+    {
+        return log_base + write_log_region_bytes() + (uint64_t)slot * sizeof(zAtomic_buffer);
+    }
+
+    inline zAtomic_buffer *cas_buffer_at(void *log_base, int slot)
+    {
+        return (zAtomic_buffer *)((char *)log_base + write_log_region_bytes() +
+                                  (size_t)slot * sizeof(zAtomic_buffer));
+    }
+
     struct zQP_requestor
     {
         ibv_qp *qp_;
@@ -353,6 +374,28 @@ namespace zrdma
         memcpy(&packed, &header, sizeof(packed));
         return packed;
     }
+
+    inline uint32_t pack_write_imm(uint16_t time_stamp, uint16_t slot)
+    {
+        return ((uint32_t)(time_stamp & 0x3FFF) << 16) | (uint32_t)slot;
+    }
+
+    inline uint16_t write_imm_time_stamp(uint32_t host_imm)
+    {
+        return (uint16_t)(host_imm >> 16);
+    }
+
+    inline uint16_t write_imm_slot(uint32_t host_imm)
+    {
+        return (uint16_t)(host_imm & 0xFFFF);
+    }
+
+    struct zImmRecvConn
+    {
+        ibv_qp *qp = NULL;
+        ibv_cq *cq = NULL;
+        zWR_entry *log = NULL;
+    };
 
     inline int prev_device_index(int current, int device_num)
     {
@@ -452,6 +495,9 @@ namespace zrdma
         uint32_t qp_info_rkey[MAX_NIC_NUM];
         std::atomic<bool> stop{false};
         thread *flush_thread_;
+        std::mutex imm_mu_;
+        std::vector<zImmRecvConn *> imm_conns_;
+        thread *imm_cq_thread_ = nullptr;
     };
 
     struct zQP
@@ -506,6 +552,8 @@ namespace zrdma
     zDCQP_responder *zDCQP_create_responder(zDevice *device, ibv_pd *pd);
     zQP_listener *zQP_listener_create(zPD *pd, zEndpoint *ep);
     void zQP_flush(zQP_listener *listener);
+    int zQP_post_imm_recvs(ibv_qp *qp, int n);
+    void zQP_imm_cq_worker(zQP_listener *listener);
     int zQP_listen(zQP_listener *zqp, int nic_index, string ip, string port);
     int zQP_accept(zQP_listener *zqp, int nic_index, rdma_cm_id *cm_id, zQPType qp_type, int node_id);
     void zQP_worker(zPD *pd, zQP_responder *qp_instance, WorkerInfo *work_info, uint32_t num);
