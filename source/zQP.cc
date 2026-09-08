@@ -35,6 +35,12 @@ namespace zrdma
         fflush(stdout);
     }
 
+    static bool full_retransmit_enabled()
+    {
+        const char *v = getenv("VARUNA_FULL_RETRANSMIT");
+        return v != NULL && v[0] == '1';
+    }
+
     static bool dcqp_failover_enabled()
     {
 #ifdef DCQP_FAILOVER
@@ -56,20 +62,20 @@ namespace zrdma
         return slot < 0 ? slot + WR_ENTRY_NUM : slot;
     }
 
+    static void wr_log_advance(zQP *qp);
+    static int pop_recovered_wc(zQP *qp, ibv_wc &wc);
+
     static int wr_log_alloc(zQP *qp)
     {
-        int start = qp->entry_start_.load();
-        int end = qp->entry_end_.load();
-        if (end - start >= WR_ENTRY_NUM)
+        wr_log_advance(qp);
+        if (qp->entry_end_.load() - qp->entry_start_.load() >= WR_ENTRY_NUM)
         {
-            return -1;
+            int slot = wr_slot(qp->entry_start_.load());
+            qp->wr_entry_[slot].wr_addr = 0;
+            qp->wr_entry_[slot].finished = 1;
+            wr_log_advance(qp);
         }
         int index = qp->entry_end_.fetch_add(1);
-        if (index - qp->entry_start_.load() >= WR_ENTRY_NUM)
-        {
-            qp->entry_end_.fetch_sub(1);
-            return -1;
-        }
         return wr_slot(index);
     }
 
@@ -99,11 +105,59 @@ namespace zrdma
     {
         int start = qp->entry_start_.load();
         int end = qp->entry_end_.load();
+        if (end - start > WR_ENTRY_NUM)
+        {
+            start = end - WR_ENTRY_NUM;
+        }
         for (int i = start; i < end; i++)
         {
             int slot = wr_slot(i);
             if (qp->wr_entry_[slot].time_stamp == time_stamp &&
                 qp->wr_entry_[slot].wr_addr == wr_addr)
+            {
+                qp->wr_entry_[slot].wr_addr = 0;
+                qp->wr_entry_[slot].finished = 1;
+            }
+        }
+        wr_log_advance(qp);
+    }
+
+    static void wr_log_complete_by_wr_id(zQP *qp, uint64_t wr_id)
+    {
+        if (wr_id == 0)
+        {
+            wr_log_advance(qp);
+            return;
+        }
+        int start = qp->entry_start_.load();
+        int end = qp->entry_end_.load();
+        if (end - start > WR_ENTRY_NUM)
+        {
+            start = end - WR_ENTRY_NUM;
+        }
+        int ts = -1;
+        for (int i = start; i < end; i++)
+        {
+            int slot = wr_slot(i);
+            if (qp->wr_entry_[slot].finished == 1)
+            {
+                continue;
+            }
+            if (qp->wr_entry_[slot].reserved == wr_id)
+            {
+                ts = (int)qp->wr_entry_[slot].time_stamp;
+                break;
+            }
+        }
+        for (int i = start; i < end; i++)
+        {
+            int slot = wr_slot(i);
+            if (qp->wr_entry_[slot].finished == 1)
+            {
+                continue;
+            }
+            if (qp->wr_entry_[slot].reserved == wr_id ||
+                (ts >= 0 && (int)qp->wr_entry_[slot].time_stamp == ts))
             {
                 qp->wr_entry_[slot].wr_addr = 0;
                 qp->wr_entry_[slot].finished = 1;
@@ -2196,6 +2250,10 @@ namespace zrdma
 
 
     int z_poll_till_completion(zQP *qp) {
+        if (!requestor_ready(qp, qp->current_device))
+        {
+            return 0;
+        }
         zQP_requestor *requestor = qp->m_requestors[qp->current_device];
         int result;
         auto start = TIME_NOW;
@@ -2209,8 +2267,7 @@ namespace zrdma
 #ifdef RECOVERY
                 z_recovery(qp);
 #endif
-                result = -1;
-                // std::cerr << "Error, read timeout" << std::endl;
+                result = 0;
                 break;
             }
             if (ibv_poll_cq(cq, 1, &wc) > 0)
@@ -2221,31 +2278,61 @@ namespace zrdma
 #ifdef RECOVERY
                     z_recovery(qp);
 #endif
-                    result = -1;
+                    result = 0;
                     break;
                 }
+                wr_log_complete_by_wr_id(qp, wc.wr_id);
                 result = 0;
                 break;
             }
         }
-        // qp->size_counter_.fetch_add(length);
         return result;
     }
 
     int z_poll_send_completion(zQP *qp, ibv_wc& wc) {
-        zQP_requestor *requestor = qp->m_requestors[qp->current_device];
-        ibv_cq *cq = requestor->cq_;
-        int ret = ibv_poll_cq(cq, 1, &wc);
-        if(ret > 0) {
+        if (pop_recovered_wc(qp, wc) > 0)
+        {
+            return 1;
+        }
+        int ret = 0;
+        int nreq = (int)qp->m_requestors.size();
+        int upto = qp->current_device;
+        if (upto >= nreq)
+        {
+            upto = nreq - 1;
+        }
+        for (int i = 0; i <= upto; i++)
+        {
+            zQP_requestor *requestor = qp->m_requestors[i];
+            if (requestor == NULL || requestor->status_ != ZSTATUS_CONNECTED || requestor->cq_ == NULL)
+            {
+                continue;
+            }
+            ret = ibv_poll_cq(requestor->cq_, 1, &wc);
+            if (ret <= 0)
+            {
+                continue;
+            }
             if (wc.status != IBV_WC_SUCCESS)
+            {
+                if (i == qp->current_device)
                 {
                     z_switch(qp);
 #ifdef RECOVERY
                     z_recovery(qp);
 #endif
                 }
+                if (pop_recovered_wc(qp, wc) > 0)
+                {
+                    return 1;
+                }
+                wc.status = IBV_WC_SUCCESS;
+                return 0;
+            }
+            wr_log_complete_by_wr_id(qp, wc.wr_id);
+            return ret;
         }
-        return ret;
+        return 0;
     }
 
     int zQP_write(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t length, void *remote_addr, uint32_t rkey, uint32_t time_stamp, bool use_log)
@@ -2903,6 +2990,7 @@ namespace zrdma
         ibv_send_wr *copy_wr = new ibv_send_wr();
         ibv_send_wr *p = send_wr;
         ibv_send_wr *q = copy_wr;
+        ibv_send_wr *prev_q = NULL;
         std::set<ibv_send_wr *> wr_set;
         int start_index = -1;
         int end_index = 0;
@@ -2954,46 +3042,112 @@ namespace zrdma
             if (!unique_cas && q->opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
             {
                 int entry_index = wr_log_alloc(zqp);
-        if (entry_index < 0)
-        {
-            return -1;
-        }
+                if (entry_index < 0)
+                {
+                    return -1;
+                }
+                if (start_index == -1)
+                {
+                    start_index = entry_index;
+                }
+                end_index = entry_index;
                 zAtomic_entry *entry = new zAtomic_entry();
                 entry->time_stamp = time_stamp;
                 entry->qp_id = zqp->qp_id_;
                 entry->offset = entry_index;
-
-                // struct ibv_send_wr *send_wr = new ibv_send_wr();
-                // struct ibv_send_wr *bad_send_wr;
+                uint64_t orig_swap = q->wr.atomic.swap;
+                uint64_t uid = *(uint64_t *)entry;
                 zqp->wr_entry_[entry_index].time_stamp = time_stamp;
                 zqp->wr_entry_[entry_index].wr_addr = (uint64_t)q;
-                zqp->wr_entry_[entry_index].finished = 1;
-                zqp->wr_entry_[entry_index].reserved = q->wr.atomic.swap;
+                zqp->wr_entry_[entry_index].finished = 0;
+                zqp->wr_entry_[entry_index].reserved = orig_swap;
+                wr_set.insert(q);
 
-                q->wr.atomic.swap = *(uint64_t *)entry;
+                q->wr.atomic.swap = uid;
+                q->send_flags &= ~IBV_SEND_SIGNALED;
 
                 struct ibv_sge *buffer_sge = new ibv_sge();
                 struct ibv_send_wr *buffer_wr = new ibv_send_wr();
                 zAtomic_buffer *buffer = new zAtomic_buffer();
-                buffer->buffer = zqp->wr_entry_[entry_index].reserved;
+                buffer->buffer = orig_swap;
                 buffer->finished = 0;
-                buffer->target_addr = (uint64_t)(q->wr.atomic.remote_addr);
+                buffer->target_addr = (uint64_t)q->wr.atomic.remote_addr;
                 buffer->time_stamp = time_stamp;
-                uint64_t wr_id = *((uint64_t *)(&zqp->wr_entry_[entry_index]) + 1);
-                buffer_sge->addr = (uint64_t)(buffer);
+                copy_wrs.push_back(buffer_wr);
+                copy_sges.push_back(buffer_sge);
+                uint32_t log_rkey = requestor->server_cmd_rkey_[zqp->current_device];
+                if (log_rkey == 0)
+                {
+                    log_rkey = requestor->server_cmd_rkey_[0];
+                }
+                buffer_sge->addr = (uint64_t)buffer;
                 buffer_sge->length = sizeof(zAtomic_buffer);
                 buffer_sge->lkey = 0;
-                buffer_wr->wr_id = wr_id;
+                buffer_wr->wr_id = 0;
                 buffer_wr->sg_list = buffer_sge;
                 buffer_wr->num_sge = 1;
-                buffer_wr->next = NULL;
                 buffer_wr->opcode = IBV_WR_RDMA_WRITE;
                 buffer_wr->send_flags = IBV_SEND_INLINE;
                 buffer_wr->wr.rdma.remote_addr = cas_buffer_remote_addr(requestor->server_cmd_msg_, entry_index);
-                buffer_wr->wr.rdma.rkey = requestor->server_cmd_rkey_[zqp->current_device];
-                q->next = buffer_wr;
-                q = q->next;
-                // zqp->entry_end_ = (zqp->entry_end_ + 1)%WR_ENTRY_NUM;
+                buffer_wr->wr.rdma.rkey = log_rkey;
+
+                ibv_mr *step_mr = requestor->resp_mr_;
+                CmdMsgRespBlock *step_local = requestor->cmd_resp_;
+                struct ibv_sge *step_sge = new ibv_sge();
+                struct ibv_send_wr *step_wr = new ibv_send_wr();
+                copy_wrs.push_back(step_wr);
+                copy_sges.push_back(step_sge);
+                step_sge->addr = (uint64_t)step_local;
+                step_sge->length = sizeof(uint64_t);
+                step_sge->lkey = step_mr ? step_mr->lkey : 0;
+                step_wr->wr_id = 0;
+                step_wr->sg_list = step_sge;
+                step_wr->num_sge = 1;
+                step_wr->opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
+                step_wr->send_flags = 0;
+                step_wr->wr.atomic.remote_addr = q->wr.atomic.remote_addr;
+                step_wr->wr.atomic.rkey = q->wr.atomic.rkey;
+                step_wr->wr.atomic.compare_add = uid;
+                step_wr->wr.atomic.swap = orig_swap;
+
+                zAtomic_buffer *done_buf = new zAtomic_buffer();
+                *done_buf = *buffer;
+                done_buf->finished = 0;
+                uint64_t done_cmp = *((uint64_t *)done_buf + 1);
+                done_buf->finished = 1;
+                uint64_t done_swap = *((uint64_t *)done_buf + 1);
+                struct ibv_sge *done_sge = new ibv_sge();
+                struct ibv_send_wr *done_wr = new ibv_send_wr();
+                copy_wrs.push_back(done_wr);
+                copy_sges.push_back(done_sge);
+                done_sge->addr = (uint64_t)((uint64_t *)step_local + 1);
+                done_sge->length = sizeof(uint64_t);
+                done_sge->lkey = step_mr ? step_mr->lkey : 0;
+                done_wr->wr_id = 0;
+                done_wr->sg_list = done_sge;
+                done_wr->num_sge = 1;
+                done_wr->opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
+                done_wr->send_flags = 0;
+                done_wr->wr.atomic.remote_addr =
+                    cas_buffer_remote_addr(requestor->server_cmd_msg_, entry_index) + sizeof(uint64_t);
+                done_wr->wr.atomic.rkey = log_rkey;
+                done_wr->wr.atomic.compare_add = done_cmp;
+                done_wr->wr.atomic.swap = done_swap;
+
+                ibv_send_wr *cas_wr = q;
+                buffer_wr->next = cas_wr;
+                cas_wr->next = step_wr;
+                step_wr->next = done_wr;
+                done_wr->next = NULL;
+                if (copy_wr == cas_wr)
+                {
+                    copy_wr = buffer_wr;
+                }
+                else if (prev_q != NULL)
+                {
+                    prev_q->next = buffer_wr;
+                }
+                q = done_wr;
             }
             else if (p->opcode == IBV_WR_RDMA_WRITE || p->opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
             {
@@ -3010,9 +3164,13 @@ namespace zrdma
                 zqp->wr_entry_[entry_index].time_stamp = time_stamp;
                 zqp->wr_entry_[entry_index].wr_addr = (uint64_t)q;
                 zqp->wr_entry_[entry_index].finished = 0;
+                zqp->wr_entry_[entry_index].reserved = q->wr_id;
                 wr_set.insert(q);
+#ifdef LOG
                 fill_logged_write_imm(q, time_stamp, entry_index);
+#endif
             }
+#ifdef LOG
             else if (p->opcode == IBV_WR_SEND || p->opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
             {
                 struct ibv_sge *log_sge = new ibv_sge();
@@ -3038,6 +3196,7 @@ namespace zrdma
                 zqp->wr_entry_[entry_index].time_stamp = entry->time_stamp;
                 zqp->wr_entry_[entry_index].wr_addr = entry->wr_addr;
                 zqp->wr_entry_[entry_index].finished = 0;
+                zqp->wr_entry_[entry_index].reserved = q->wr_id;
                 uint64_t wr_id = *((uint64_t *)(&zqp->wr_entry_[entry_index]) + 1);
 
                 log_sge->addr = (uint64_t)(entry);
@@ -3058,6 +3217,21 @@ namespace zrdma
                 q->send_flags &= ~IBV_SEND_SIGNALED;
                 q = q->next;
             }
+#endif
+            else
+            {
+                int entry_index = wr_log_alloc(zqp);
+                if (start_index == -1)
+                {
+                    start_index = entry_index;
+                }
+                end_index = entry_index;
+                zqp->wr_entry_[entry_index].time_stamp = time_stamp;
+                zqp->wr_entry_[entry_index].wr_addr = (uint64_t)q;
+                zqp->wr_entry_[entry_index].finished = 0;
+                zqp->wr_entry_[entry_index].reserved = q->wr_id;
+            }
+            prev_q = q;
             p = p->next;
             if (p != NULL && (max_depth < 0 || depth < max_depth))
             {
@@ -3073,10 +3247,13 @@ namespace zrdma
         q->send_flags |= IBV_SEND_SIGNALED;
         if(wr_id != -1) {
             q->wr_id = wr_id;
+            if (end_index >= 0)
+            {
+                zqp->wr_entry_[end_index % WR_ENTRY_NUM].reserved = (uint64_t)(uint32_t)wr_id;
+            }
         }
         if (retry != non_idempotent)
         {
-            std::cerr << "Warning, inconsistent non_idempotent flag" << std::endl;
             non_idempotent = retry;
         }
 
@@ -3091,30 +3268,11 @@ namespace zrdma
                 zqp->wr_entry_[i % WR_ENTRY_NUM].finished = 1;
             perror("Error, ibv_post_send failed");
         }
-        for (auto k = copy_wr; k != NULL;)
+        if (wr_ids != nullptr)
         {
-            ibv_send_wr *next = k->next;
-            if (k->opcode == IBV_WR_RDMA_READ)
-            {
-                if (k->sg_list)
-                    free(k->sg_list);
-                delete k;
-            }
-            k = next;
+            wr_ids->push_back(q->wr_id);
         }
-        wr_ids->push_back(q->wr_id);
-        int result = 0;
-        for (auto wr : copy_wrs) {
-            delete wr;
-        }
-        for (auto sge : copy_sges) {
-            delete sge;
-        }
-        for (auto entry : wr_entries) {
-            delete entry;
-        }
-        // zqp->size_counter_.fetch_add(length);
-        return result;
+        return 0;
     }
 
     int zQP_read_async(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t length, void *remote_addr, uint32_t rkey, uint32_t time_stamp, vector<uint64_t> *wr_ids)
@@ -3536,6 +3694,10 @@ namespace zrdma
             qp->m_rkey_table->at(resp_msg->rkey[0]).push_back(resp_msg->rkey[i]);
         }
         *rkey = resp_msg->rkey[0];
+        if (qp->m_fast_rkey && MAX_NIC_NUM > 1)
+        {
+            *(qp->m_fast_rkey) = resp_msg->rkey[1];
+        }
         return;
     }
 
@@ -3587,6 +3749,10 @@ namespace zrdma
             qp->m_rkey_table->at(resp_msg->rkey[0]).push_back(resp_msg->rkey[i]);
         }
         *rkey = resp_msg->rkey[0];
+        if (qp->m_fast_rkey && MAX_NIC_NUM > 1)
+        {
+            *(qp->m_fast_rkey) = resp_msg->rkey[1];
+        }
         return;
     }
 
@@ -3602,16 +3768,19 @@ namespace zrdma
         {
             qp->time_stamp = (qp->time_stamp + 1) % MAX_REQUESTOR_NUM;
             int result = zQP_post_send_async(qp, send_wr, bad_wr, non_idempotent, qp->time_stamp, wr_ids, unique_cas, max_depth, wr_id);
-            if (result == -1)
-            {
-                z_switch(qp);
-                return z_post_send_async(qp, send_wr, bad_wr, non_idempotent, time_stamp, wr_ids, unique_cas, max_depth, wr_id);
-            }
             return result;
         }
         else
         {
-            int result = zDCQP_send(qp, qp->m_pd->m_requestors[qp->current_device][0], qp->m_targets[qp->current_device]->ah, send_wr, qp->m_targets[qp->current_device]->lid_, qp->m_targets[qp->current_device]->dct_num_, max_depth);
+            int dcqp_idx = 0;
+            if (qp->current_device >= 0 &&
+                qp->current_device < (int)qp->m_pd->m_requestors.size() &&
+                qp->bound_dcqps_ >= 0 &&
+                qp->bound_dcqps_ < (int)qp->m_pd->m_requestors[qp->current_device].size())
+            {
+                dcqp_idx = qp->bound_dcqps_;
+            }
+            int result = zDCQP_send(qp, qp->m_pd->m_requestors[qp->current_device][dcqp_idx], qp->m_targets[qp->current_device]->ah, send_wr, qp->m_targets[qp->current_device]->lid_, qp->m_targets[qp->current_device]->dct_num_, max_depth);
             return result;
         }
     }
@@ -4093,6 +4262,124 @@ namespace zrdma
         return 0;
     }
 
+    static bool is_app_coro_wr_id(uint64_t wr_id)
+    {
+        return wr_id != 0 && wr_id != magic_number && wr_id <= 64;
+    }
+
+    static bool note_recovered_wr_id(zQP *qp, uint64_t wr_id)
+    {
+        if (!is_app_coro_wr_id(wr_id))
+        {
+            return false;
+        }
+        std::lock_guard<std::mutex> g(qp->recovered_mu_);
+        qp->recovered_wr_ids_.push_back(wr_id);
+        return true;
+    }
+
+    static bool wr_owned_by_other_slot(zQP *qp, int start, int end, int self_slot, ibv_send_wr *wr)
+    {
+        if (wr == NULL)
+        {
+            return false;
+        }
+        uint64_t addr = (uint64_t)wr;
+        for (int i = start; i < end; i++)
+        {
+            int slot = wr_slot(i);
+            if (slot == self_slot)
+            {
+                continue;
+            }
+            if (qp->wr_entry_[slot].wr_addr == addr)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Motor counts one pending ACK per doorbell / post_send, not per log slot
+    // and not per unique wr_id. Inject one fake CQE for each recovered post
+    // that would have produced a signaled completion.
+    static int queue_slot_completions(zQP *qp, ibv_send_wr *send_wr, int start, int end, int self_slot)
+    {
+        int n = 0;
+        for (ibv_send_wr *p = send_wr; p != NULL; p = p->next)
+        {
+            if (p != send_wr && wr_owned_by_other_slot(qp, start, end, self_slot, p))
+            {
+                break;
+            }
+            if ((p->send_flags & IBV_SEND_SIGNALED) && note_recovered_wr_id(qp, p->wr_id))
+            {
+                n++;
+            }
+        }
+        if (n == 0 && note_recovered_wr_id(qp, send_wr->wr_id))
+        {
+            n++;
+        }
+        return n;
+    }
+
+    static int pop_recovered_wc(zQP *qp, ibv_wc &wc)
+    {
+        std::lock_guard<std::mutex> g(qp->recovered_mu_);
+        if (qp->recovered_wr_ids_.empty())
+        {
+            return 0;
+        }
+        memset(&wc, 0, sizeof(wc));
+        wc.status = IBV_WC_SUCCESS;
+        wc.wr_id = qp->recovered_wr_ids_.front();
+        qp->recovered_wr_ids_.erase(qp->recovered_wr_ids_.begin());
+        wc.opcode = IBV_WC_RDMA_WRITE;
+        return 1;
+    }
+
+    static int recover_native_cas(zQP *qp, ibv_send_wr *send_wr, bool full)
+    {
+        uint64_t expected = send_wr->wr.atomic.compare_add;
+        uint64_t swap = send_wr->wr.atomic.swap;
+        void *local = (void *)(uintptr_t)send_wr->sg_list->addr;
+        uint32_t lkey = send_wr->sg_list->lkey;
+        void *target = (void *)send_wr->wr.atomic.remote_addr;
+        uint32_t rkey = send_wr->wr.atomic.rkey;
+        if (full)
+        {
+            *(uint64_t *)local = expected;
+            int rc = path_cas(qp, local, lkey, swap, target, rkey);
+            printf("FULL retransmit CAS cmp=%lu swap=%lu result=%lu rc=%d\n",
+                   (unsigned long)expected, (unsigned long)swap,
+                   (unsigned long)*(uint64_t *)local, rc);
+            return rc;
+        }
+        uint64_t observed = 0;
+        void *observe_buf = qp->cmd_resp_;
+        uint32_t observe_lkey = qp->resp_mr_[qp->current_device]
+                                    ? qp->resp_mr_[qp->current_device]->lkey
+                                    : qp->resp_mr_[0]->lkey;
+        if (path_read(qp, observe_buf, observe_lkey, sizeof(uint64_t), target, rkey) != 0)
+        {
+            return -1;
+        }
+        memcpy(&observed, observe_buf, sizeof(uint64_t));
+        if (observed == swap)
+        {
+            *(uint64_t *)local = expected;
+            return 0;
+        }
+        if (observed == expected)
+        {
+            *(uint64_t *)local = expected;
+            return path_cas(qp, local, lkey, swap, target, rkey);
+        }
+        *(uint64_t *)local = observed;
+        return 0;
+    }
+
     static int recover_cas(zQP *qp, int slot, ibv_send_wr *send_wr, zAtomic_buffer *remote_buf)
     {
         uint64_t expected = send_wr->wr.atomic.compare_add;
@@ -4210,8 +4497,12 @@ namespace zrdma
             qp->in_recovery.store(false);
             return -1;
         }
-        zWR_entry *entry = (zWR_entry *)qp->cmd_resp_;
+        CmdMsgRespBlock log_copy;
+        memcpy(&log_copy, qp->cmd_resp_, sizeof(log_copy));
+        zWR_entry *entry = (zWR_entry *)&log_copy;
         int rc = 0;
+        bool full = full_retransmit_enabled();
+        int n_inflight = 0, n_rexmit = 0, n_skip = 0, n_cas = 0, n_wake = 0;
         for (int i = start; i < end; i++)
         {
             int slot = wr_slot(i);
@@ -4224,36 +4515,53 @@ namespace zrdma
             {
                 continue;
             }
+            n_inflight++;
             if (send_wr->opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
             {
+                n_cas++;
                 zAtomic_buffer cas_buf{};
                 uint32_t cas_lkey = qp->msg_mr_[qp->current_device]
                                         ? qp->msg_mr_[qp->current_device]->lkey
                                         : qp->msg_mr_[0]->lkey;
                 uint64_t cas_remote = cas_buffer_remote_addr(log_src->server_cmd_msg_, slot);
-                if (path_read(qp, (void *)qp->cmd_msg_, cas_lkey, sizeof(zAtomic_buffer),
-                              (void *)cas_remote, log_rkey) != 0)
+                bool buffer_ok = path_read(qp, (void *)qp->cmd_msg_, cas_lkey, sizeof(zAtomic_buffer),
+                                           (void *)cas_remote, log_rkey) == 0;
+                if (buffer_ok)
                 {
-                    rc = -1;
+                    memcpy(&cas_buf, qp->cmd_msg_, sizeof(cas_buf));
+                }
+                bool two_phase = buffer_ok &&
+                                 (cas_buf.time_stamp == qp->wr_entry_[slot].time_stamp);
+                int cas_rc = 0;
+                if (two_phase && !full)
+                {
+                    cas_rc = recover_cas(qp, slot, send_wr, &cas_buf);
+                    n_skip++;
                 }
                 else
                 {
-                    memcpy(&cas_buf, qp->cmd_msg_, sizeof(cas_buf));
-                    if (recover_cas(qp, slot, send_wr, &cas_buf) != 0)
-                    {
-                        rc = -1;
-                    }
+                    cas_rc = recover_native_cas(qp, send_wr, full);
+                    n_rexmit++;
+                }
+                if (cas_rc != 0)
+                {
+                    rc = -1;
                 }
             }
             else
             {
                 int local_time = qp->wr_entry_[slot].time_stamp;
                 int remote_time = entry[slot].time_stamp;
-#ifndef SEND_TWICE
-                if (local_time != remote_time)
+                // READ never posts IMM into the completion log. Matching
+                // timestamps here are leftover from a prior WRITE in the
+                // same circular slot, so a skip leaves the local buffer
+                // unfilled. Always re-read; only WRITE uses the log.
+                bool is_read = (send_wr->opcode == IBV_WR_RDMA_READ);
+                bool need_rexmit = full || is_read || (local_time != remote_time);
+                if (need_rexmit)
                 {
-#endif
-                    if (send_wr->opcode == IBV_WR_RDMA_READ)
+                    n_rexmit++;
+                    if (is_read)
                     {
                         if (path_read(qp, (void *)send_wr->sg_list->addr, send_wr->sg_list->lkey,
                                       send_wr->sg_list->length, (void *)send_wr->wr.rdma.remote_addr,
@@ -4288,16 +4596,37 @@ namespace zrdma
                     {
                         qp->size_counter_.fetch_add(send_wr->sg_list->length);
                     }
-#ifndef SEND_TWICE
                 }
-#endif
+                else
+                {
+                    n_skip++;
+                }
+            }
+        }
+        // Inject CQEs only after every in-flight READ has been refilled.
+        // Queuing them inside the loop lets the Motor poller resume a
+        // coroutine while later slots are still empty.
+        for (int i = start; i < end; i++)
+        {
+            int slot = wr_slot(i);
+            if (qp->wr_entry_[slot].wr_addr == 0 || qp->wr_entry_[slot].finished == 1)
+            {
+                continue;
+            }
+            struct ibv_send_wr *send_wr = (struct ibv_send_wr *)qp->wr_entry_[slot].wr_addr;
+            if (send_wr != NULL)
+            {
+                n_wake += queue_slot_completions(qp, send_wr, start, end, slot);
             }
             qp->wr_entry_[slot].wr_addr = 0;
             qp->wr_entry_[slot].finished = 1;
         }
         wr_log_advance(qp);
         qp->in_recovery.store(false);
-        printf("Finish recovery %d at time %lu\n", qp->current_device, TIME_NOW.time_since_epoch().count());
+        printf("Finish recovery device=%d mode=%s inflight=%d rexmit=%d skip=%d cas=%d wake=%d rc=%d at %lu\n",
+               qp->current_device, full ? "FULL" : "SELECTIVE",
+               n_inflight, n_rexmit, n_skip, n_cas, n_wake, rc,
+               (unsigned long)TIME_NOW.time_since_epoch().count());
         return rc;
     }
 
@@ -4387,6 +4716,18 @@ namespace zrdma
         return mr_create(pd, (void *)addr, length);
     }
 
+    int zQP_reg_mem(zQP_listener *zqp, void *addr, size_t length)
+    {
+        ibv_mr *mr = mr_create(zqp->m_pd, addr, length);
+        if (mr == NULL)
+        {
+            printf("Error, register memory failed\n");
+            return -1;
+        }
+        zqp->mem_ = mr;
+        return 0;
+    }
+
     int zQP_listen(zQP_listener *zqp, int nic_index, string ip, string port)
     {
         if (zqp->listeners.find(nic_index) != zqp->listeners.end())
@@ -4395,6 +4736,7 @@ namespace zrdma
         }
         zQP_responder *qp = new zQP_responder();
         zqp->listeners[nic_index] = qp;
+        qp->mem_ = zqp->mem_;
 
         qp->worker_info_ = new WorkerInfo *[MAX_SERVER_WORKER * MAX_SERVER_CLIENT];
         qp->worker_threads_ = new std::thread *[MAX_SERVER_WORKER];
@@ -4509,20 +4851,25 @@ namespace zrdma
             {
                 RegisterRequest *reg_req = (RegisterRequest *)request;
                 RegisterResponse *resp_msg = (RegisterResponse *)cmd_resp;
-                if (cache_mr == NULL)
+                ibv_mr *fetch_mr = qp_instance->mem_;
+                if (fetch_mr == NULL)
                 {
-                    uint64_t cache_size = (size_t)1024 * 1024 * 1024;
-                    cache_mr = mr_malloc_create(pd, cache_addr, cache_size);
+                    if (cache_mr == NULL)
+                    {
+                        uint64_t cache_size = (size_t)1024 * 1024 * 1024;
+                        cache_mr = mr_malloc_create(pd, cache_addr, cache_size);
+                    }
+                    fetch_mr = cache_mr;
                 }
-                if (cache_mr == NULL)
+                if (fetch_mr == NULL)
                 {
                     resp_msg->status = RES_FAIL;
                 }
                 else
                 {
-                    resp_msg->addr = (uint64_t)(cache_mr->addr);
+                    resp_msg->addr = (uint64_t)(fetch_mr->addr);
                     tbb::concurrent_hash_map<ibv_mr *, tbb::concurrent_vector<ibv_mr *>>::accessor a;
-                    pd->m_mrs.find(a, cache_mr);
+                    pd->m_mrs.find(a, fetch_mr);
                     for (int i = 0; i < a->second.size(); i++)
                     {
                         resp_msg->rkey[i] = a->second[i]->rkey;

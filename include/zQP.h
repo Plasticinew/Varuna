@@ -31,6 +31,8 @@ using std::vector;
 namespace zrdma
 {
 
+const uint64_t magic_number = 0xdeadbeefcafebabe;
+
 #define NOTIFY_WORK 0xFF
 #define NOTIFY_IDLE 0x00
 #define MAX_MSG_SIZE 16384
@@ -258,6 +260,8 @@ namespace zrdma
         vector<vector<zDCQP_requestor *>> m_requestors;
         vector<vector<zDCQP_responder *>> m_responders;
         std::mutex pd_mutex;
+        std::atomic<int> bound_dcqps_{0};
+        uint32_t m_fast_lkey = 0;
     };
 
     struct zWR_entry
@@ -482,6 +486,7 @@ namespace zrdma
         uint32_t worker_num_ = 0;
         WorkerInfo **worker_info_;
         thread **worker_threads_;
+        ibv_mr *mem_ = nullptr;
     };
 
     struct zQP_listener
@@ -498,6 +503,7 @@ namespace zrdma
         std::mutex imm_mu_;
         std::vector<zImmRecvConn *> imm_conns_;
         thread *imm_cq_thread_ = nullptr;
+        ibv_mr *mem_ = nullptr;
     };
 
     struct zQP
@@ -507,6 +513,8 @@ namespace zrdma
         rkeyTable *m_rkey_table;
         uint32_t quick_rkey = 0;
         uint32_t quick_lkey = 0;
+        uint32_t *m_fast_rkey = nullptr;
+        int bound_dcqps_ = 0;
         tbb::concurrent_vector<zQP_requestor *> m_requestors;
         unordered_map<int, zTarget *> m_targets;
         int primary_device = 0;
@@ -526,6 +534,8 @@ namespace zrdma
         std::atomic<int> entry_end_{0};
         std::atomic<bool> in_recovery{false};
         std::mutex recovery_mutex;
+        std::mutex recovered_mu_;
+        std::vector<uint64_t> recovered_wr_ids_;
         std::atomic<uint64_t> size_counter_{0};
         zQPType qp_type;
         int qp_id_ = 0;
@@ -563,6 +573,7 @@ namespace zrdma
     int z_simple_write_async(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t length, void *remote_addr, uint32_t rkey, vector<uint64_t> *wr_ids);
     int z_simple_read_async(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t length, void *remote_addr, uint32_t rkey, vector<uint64_t> *wr_ids);
     int z_simple_CAS(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t new_val, void *remote_addr, uint32_t rkey);
+    int z_simple_CAS_async(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t new_val, void *remote_addr, uint32_t rkey, vector<uint64_t> *wr_ids);
     int zQP_read(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t length, void *remote_addr, uint32_t rkey, uint32_t time_stamp);
     int zQP_write(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t length, void *remote_addr, uint32_t rkey, uint32_t time_stamp, bool use_log);
     int zQP_CAS(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t new_val, void *remote_addr, uint32_t rkey, uint32_t time_stamp);
@@ -573,7 +584,7 @@ namespace zrdma
     int zQP_CAS_async(zQP *zqp, void *local_addr, uint32_t lkey, uint64_t new_val, void *remote_addr, uint32_t rkey, uint32_t time_stamp, vector<uint64_t> *wr_ids);
     int zQP_CAS_step2_async(zQP *zqp, uint64_t new_val, void *remote_addr, uint32_t rkey, uint32_t time_stamp, uint64_t offset);
     int zQP_poll_thread(zEndpoint *zep);
-    int zQP_post_send_async(zQP *zqp, ibv_send_wr *send_wr, ibv_send_wr **bad_wr, bool non_idempotent, uint32_t time_stamp, vector<uint64_t> *wr_ids, bool unique_cas, int max_depth=-1);
+    int zQP_post_send_async(zQP *zqp, ibv_send_wr *send_wr, ibv_send_wr **bad_wr, bool non_idempotent, uint32_t time_stamp, vector<uint64_t> *wr_ids, bool unique_cas, int max_depth=-1, int wr_id=-1);
     int zQP_post_send(zQP *zqp, ibv_send_wr *send_wr, ibv_send_wr **bad_wr, bool non_idempotent, 
         uint32_t time_stamp, bool unique_cas, int max_depth=-1);
 
@@ -605,6 +616,7 @@ namespace zrdma
     int load_config(const char *fname, struct zDeviceConfig *config);
     int load_config(const char *fname, struct zTargetConfig *config);
 
+    int zQP_reg_mem(zQP_listener *zqp, void *addr, size_t length);
     ibv_mr *mr_create(ibv_pd *pd, void *addr, size_t length);
     ibv_mr *mr_malloc_create(zPD *pd, uint64_t &addr, size_t length);
     ibv_mr *mr_create(zPD *pd, void* addr, size_t length);

@@ -18,6 +18,9 @@ target_link_libraries(latency_test zQP )
 add_executable(bw_timeline bw_timeline.cc)
 target_link_libraries(bw_timeline zQP )
 
+add_executable(recover_correct recover_correct.cc)
+target_link_libraries(recover_correct zQP )
+
 install(TARGETS zQP
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib

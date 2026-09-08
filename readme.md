@@ -2,7 +2,7 @@
 
 Varuna 是论文 **“Varuna: Enabling Failure-Type Aware RDMA Failover”** 的研究原型，目标是在 RDMA 链路故障或链路抖动时，实现故障类型感知、语义正确且低开销的快速切换。
 
-论文全文见 [`docs/Varuna.pdf`](docs/Varuna.pdf)。本仓库主要实现论文中的 RDMA 运行时、故障恢复机制和微基准测试；论文评估使用的 Motor/TPC-C 事务系统集成不包含在当前仓库中。
+论文全文见 [`docs/Varuna.pdf`](docs/Varuna.pdf)。本仓库实现论文中的 RDMA 运行时、故障恢复机制和微基准测试，并在 [`tests/motor`](tests/motor) 中集成 Motor/TPC-C 作为应用层测试（来源：[Motor_Zep](https://github.com/Plasticinew/Motor_Zep.git)）。
 
 仓库当前主要用于论文原型验证和性能实验，尚不是开箱即用的通用 RDMA SDK。示例程序包含实验环境相关的网卡名称、IP 地址和链路启停操作，运行前请先阅读[注意事项](#注意事项)。
 
@@ -299,7 +299,7 @@ pprof --text ./build/source/latency_test latency_test.prof
 - 在实际环境运行前，应先修改 `source/zClient.cc` 与 `source/latency_test.cc` 中的网卡控制逻辑，或移除故障注入代码。
 - 论文描述的是 DCQP 立即接管、RCQP 后台异步重建的完整设计；默认已启用 `ASYNC_CONNECT`。若要复现预连接备用 RCQP 的 Resend-cache 基线，请在 `latency_test` 中定义 `PRECONNECT_BACKUP`。
 - 论文描述了固件/驱动事件、CQ error 和 heartbeat 等组合式故障检测；当前代码主要依赖 completion error、超时和测试程序中的手动断链，没有实现完整的可配置 heartbeat 子系统。
-- 论文中的 Motor/TPC-C 集成、应用层评估代码以及部分 baseline 不在当前仓库内。
+- 论文中的部分 baseline 不在当前仓库内。Motor/TPC-C 应用层测试见 [`tests/motor`](tests/motor)，运行方式见 [`tests/motor/RUN.md`](tests/motor/RUN.md)。
 - 配置解析失败目前没有完善的错误报告，错误的 JSON、数组长度不一致或不存在的 RDMA 设备可能导致断言失败或进程退出。
 - 项目没有自动化测试，示例程序本身就是当前的集成与性能测试入口。
 - 代码和脚本包含针对特定实验集群的参数，建议先在隔离环境中验证，不要直接用于生产系统。
