@@ -785,28 +785,50 @@ static int write_full(int fd, const void *buf, size_t len)
     return 0;
 }
 
+static int connect_ms(int fd, const struct sockaddr *addr, socklen_t len, int timeout_ms)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    struct pollfd pfd;
+    int err = 0;
+    socklen_t errlen = sizeof(err);
+    int rc;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0)
+        return -1;
+    rc = connect(fd, addr, len);
+    if (rc == 0)
+        return 0;
+    if (errno != EINPROGRESS)
+        return -1;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    if (poll(&pfd, 1, timeout_ms) <= 0)
+        return -1;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0)
+        return -1;
+    return 0;
+}
+
 static int send_report(const char *dst, int port, const struct report *rep)
 {
     int i;
-    for (i = 0; i < 25; i++) {
+    for (i = 0; i < 5; i++) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in addr;
-        int rc;
         if (fd < 0)
             return -1;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t)port);
         inet_pton(AF_INET, dst, &addr.sin_addr);
-        rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-        if (rc == 0 && write_full(fd, rep, sizeof(*rep)) == 0) {
+        if (connect_ms(fd, (struct sockaddr *)&addr, sizeof(addr), 300) == 0 &&
+            write_full(fd, rep, sizeof(*rep)) == 0) {
             close(fd);
             return 0;
         }
         close(fd);
         if (g_stop)
             return -1;
-        usleep(200000);
+        usleep(100000);
     }
     return -1;
 }
@@ -858,7 +880,6 @@ static int run_client(struct client_cfg *cfg)
     struct rdma_event_channel *ch = NULL;
     struct rdma_cm_id *id = NULL;
     struct rdma_cm_event *ev = NULL;
-    struct sockaddr_in src;
     struct sockaddr_in dst;
     struct ibv_pd *pd = NULL;
     struct ibv_cq *cq = NULL;
@@ -890,23 +911,29 @@ static int run_client(struct client_cfg *cfg)
         perror("rdma id");
         return 1;
     }
-    memset(&src, 0, sizeof(src));
     memset(&dst, 0, sizeof(dst));
-    src.sin_family = AF_INET;
     dst.sin_family = AF_INET;
     dst.sin_port = htons((uint16_t)cfg->port);
-    if (inet_pton(AF_INET, cfg->src, &src.sin_addr) != 1 ||
-        inet_pton(AF_INET, cfg->dst, &dst.sin_addr) != 1) {
+    if (inet_pton(AF_INET, cfg->dst, &dst.sin_addr) != 1) {
         fprintf(stderr, "bad address\n");
         return 1;
     }
-    if (rdma_resolve_addr(id, (struct sockaddr *)&src, (struct sockaddr *)&dst, 2000) != 0) {
+    /*
+     * Do not pass --src. The same address is also configured on the vxlan
+     * devices, and rdma_resolve_addr binds the source with ip_dev_find before
+     * the route lookup. That picks a vxlan, then neighbor resolution times out
+     * (ADDR_ERROR -110) even though the route and ping use bond1. With a
+     * wildcard source, the route to --dst selects bond1.
+     */
+    outf("resolve dst %s by route (src %s is also on vxlan)\n", cfg->dst, cfg->src);
+    if (rdma_resolve_addr(id, NULL, (struct sockaddr *)&dst, 2000) != 0) {
         perror("rdma_resolve_addr");
         return 1;
     }
     if (expect_cm(ch, RDMA_CM_EVENT_ADDR_RESOLVED, &ev) != 0)
         return 1;
     rdma_ack_cm_event(ev);
+    outf("resolved src %s\n", inet_ntoa(id->route.addr.src_sin.sin_addr));
     snprintf(g_devname, sizeof(g_devname), "%s", id->verbs->device->name);
     outf("device %s\n", g_devname);
     if (strstr(g_devname, "bond") == NULL)
