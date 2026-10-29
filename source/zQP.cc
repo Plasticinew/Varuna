@@ -65,6 +65,53 @@ namespace zrdma
     static void wr_log_advance(zQP *qp);
     static int pop_recovered_wc(zQP *qp, ibv_wc &wc);
 
+    struct ZqpSpan
+    {
+        zQP *qp;
+        uint64_t wr_id;
+        int begin;
+        int end;
+    };
+    static const unsigned ZQP_SPAN_CAP = 256;
+    static thread_local ZqpSpan zqp_spans[ZQP_SPAN_CAP];
+    static thread_local unsigned zqp_span_head = 0;
+    static thread_local unsigned zqp_span_tail = 0;
+
+    static void zqp_span_push(zQP *qp, uint64_t wr_id, int begin, int end)
+    {
+        unsigned next = (zqp_span_tail + 1) % ZQP_SPAN_CAP;
+        if (next == zqp_span_head)
+        {
+            zqp_span_head = (zqp_span_head + 1) % ZQP_SPAN_CAP;
+        }
+        zqp_spans[zqp_span_tail].qp = qp;
+        zqp_spans[zqp_span_tail].wr_id = wr_id;
+        zqp_spans[zqp_span_tail].begin = begin;
+        zqp_spans[zqp_span_tail].end = end;
+        zqp_span_tail = next;
+    }
+
+    static bool zqp_span_retire(zQP *qp, uint64_t wr_id)
+    {
+        if (zqp_span_head == zqp_span_tail)
+        {
+            return false;
+        }
+        ZqpSpan span = zqp_spans[zqp_span_head];
+        if (span.qp != qp || span.wr_id != wr_id)
+        {
+            return false;
+        }
+        zqp_span_head = (zqp_span_head + 1) % ZQP_SPAN_CAP;
+        for (int n = span.begin; n < span.end; n++)
+        {
+            int slot = wr_slot(n);
+            qp->wr_entry_[slot].wr_addr = 0;
+            qp->wr_entry_[slot].finished = 1;
+        }
+        return true;
+    }
+
     static int wr_log_alloc(zQP *qp)
     {
         wr_log_advance(qp);
@@ -125,6 +172,11 @@ namespace zrdma
     static void wr_log_complete_by_wr_id(zQP *qp, uint64_t wr_id)
     {
         if (wr_id == 0)
+        {
+            wr_log_advance(qp);
+            return;
+        }
+        if (zqp_span_retire(qp, wr_id))
         {
             wr_log_advance(qp);
             return;
@@ -998,12 +1050,17 @@ namespace zrdma
     void zQP_imm_cq_worker(zQP_listener *listener)
     {
         struct ibv_wc wc[64];
+        int idle_spins = 0;
+        std::vector<zImmRecvConn *> snap;
         while (!listener->stop.load())
         {
-            std::vector<zImmRecvConn *> snap;
+            if (snap.empty() || (idle_spins & 255) == 0)
             {
                 std::lock_guard<std::mutex> lock(listener->imm_mu_);
-                snap = listener->imm_conns_;
+                if (snap.size() != listener->imm_conns_.size())
+                {
+                    snap = listener->imm_conns_;
+                }
             }
             bool did_work = false;
             for (size_t i = 0; i < snap.size(); i++)
@@ -1041,7 +1098,20 @@ namespace zrdma
             }
             if (!did_work)
             {
+                // A yield on every idle poll lets this thread get descheduled
+                // while WRITE_WITH_IMM completions are arriving, and the
+                // receive queue then returns RNR to the compute node.
+                idle_spins++;
+                if (idle_spins < 256)
+                {
+                    continue;
+                }
+                idle_spins = 0;
                 std::this_thread::yield();
+            }
+            else
+            {
+                idle_spins = 0;
             }
         }
     }
@@ -2981,9 +3051,161 @@ namespace zrdma
 #endif
     }
 
+    // Motor doorbells are READ / WRITE / a single CAS. The steady path keeps
+    // the completion log (WRITE_WITH_IMM, plus one inline CAS-intent write)
+    // but posts from the per-slot wr_backup/sge_backup arrays. The previous
+    // body malloc'd a WR and an SGE per operation and never freed them, and
+    // it turned every CAS into an inline write plus three CASes.
+    static bool zqp_fast_chain_ok(const ibv_send_wr *send_wr, int max_depth)
+    {
+        int depth = 0;
+        int ncas = 0;
+        for (const ibv_send_wr *p = send_wr; p != NULL; p = p->next)
+        {
+            if (max_depth >= 0 && depth >= max_depth)
+            {
+                break;
+            }
+            depth++;
+            if (depth > 120 || p->num_sge != 1 || p->sg_list == NULL)
+            {
+                return false;
+            }
+            if (p->opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
+            {
+                ncas++;
+                if (ncas > 8)
+                {
+                    return false;
+                }
+            }
+            else if (p->opcode != IBV_WR_RDMA_READ &&
+                     p->opcode != IBV_WR_RDMA_WRITE &&
+                     p->opcode != IBV_WR_RDMA_WRITE_WITH_IMM)
+            {
+                return false;
+            }
+        }
+        return depth > 0;
+    }
+
+    static int zQP_post_send_async_fast(zQP *zqp, ibv_send_wr *send_wr, ibv_send_wr **bad_wr,
+                                        uint32_t time_stamp, vector<uint64_t> *wr_ids, int max_depth,
+                                        int wr_id_override)
+    {
+        ibv_send_wr *user_wrs[128];
+        int slots[128];
+        int nuser = 0;
+        ibv_send_wr *nic_head = NULL;
+        ibv_send_wr *nic_tail = NULL;
+        int end_index = -1;
+        int depth = 0;
+        int raw_begin = zqp->entry_end_.load();
+
+        for (ibv_send_wr *p = send_wr; p != NULL; p = p->next)
+        {
+            if (max_depth >= 0 && depth >= max_depth)
+            {
+                break;
+            }
+            depth++;
+            int entry_index = wr_log_alloc(zqp);
+            end_index = entry_index;
+            ibv_send_wr *q = &zqp->wr_backup[entry_index];
+            ibv_sge *sge = &zqp->sge_backup[entry_index];
+            memcpy(q, p, sizeof(*q));
+            *sge = p->sg_list[0];
+            q->sg_list = sge;
+            q->num_sge = 1;
+            q->next = NULL;
+
+            zqp->wr_entry_[entry_index].time_stamp = time_stamp;
+            zqp->wr_entry_[entry_index].wr_addr = (uint64_t)q;
+            zqp->wr_entry_[entry_index].finished = 0;
+            zqp->wr_entry_[entry_index].reserved = q->wr_id;
+
+            if (q->opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
+            {
+                // Keep the intended swap in the local log for retransmission.
+                // An extra inline log write ahead of the CAS added a full
+                // message to every lock doorbell.
+                zqp->wr_entry_[entry_index].reserved = q->wr.atomic.swap;
+            }
+            else if (q->opcode == IBV_WR_RDMA_WRITE || q->opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
+            {
+#ifdef LOG
+                fill_logged_write_imm(q, time_stamp, entry_index);
+#endif
+            }
+            if (nic_tail != NULL)
+            {
+                nic_tail->next = q;
+            }
+            else
+            {
+                nic_head = q;
+            }
+            nic_tail = q;
+            user_wrs[nuser] = q;
+            slots[nuser] = entry_index;
+            nuser++;
+        }
+
+        if (nic_head == NULL || nic_tail == NULL)
+        {
+            return -1;
+        }
+        nic_tail->send_flags |= IBV_SEND_SIGNALED;
+        if (wr_id_override != -1)
+        {
+            nic_tail->wr_id = (uint64_t)wr_id_override;
+            if (nic_tail->opcode != IBV_WR_ATOMIC_CMP_AND_SWP && end_index >= 0)
+            {
+                zqp->wr_entry_[end_index].reserved = (uint64_t)(uint32_t)wr_id_override;
+            }
+        }
+        int rc = ibv_post_send(zqp->m_requestors[0]->qp_, nic_head, bad_wr);
+        for (int i = 0; i < nuser; i++)
+        {
+            user_wrs[i]->next = (i + 1 < nuser) ? user_wrs[i + 1] : NULL;
+        }
+        if (rc != 0)
+        {
+            for (int i = 0; i < nuser; i++)
+            {
+                zqp->wr_entry_[slots[i]].finished = 1;
+                zqp->wr_entry_[slots[i]].wr_addr = 0;
+            }
+            wr_log_advance(zqp);
+            perror("Error, ibv_post_send failed");
+            return -1;
+        }
+        zqp_span_push(zqp, nic_tail->wr_id, raw_begin, zqp->entry_end_.load());
+        if (wr_ids != nullptr)
+        {
+            wr_ids->push_back(nic_tail->wr_id);
+        }
+        return 0;
+    }
+
     int zQP_post_send_async(zQP *zqp, ibv_send_wr *send_wr, ibv_send_wr **bad_wr, bool non_idempotent,
                             uint32_t time_stamp, vector<uint64_t> *wr_ids, bool unique_cas, int max_depth, int wr_id)
     {
+        if (!unique_cas && zqp->current_device == 0 &&
+            !zqp->m_requestors.empty() && zqp->m_requestors[0] != NULL &&
+            zqp->m_requestors[0]->status_ == ZSTATUS_CONNECTED &&
+            zqp_fast_chain_ok(send_wr, max_depth))
+        {
+            return zQP_post_send_async_fast(zqp, send_wr, bad_wr, time_stamp, wr_ids, max_depth, wr_id);
+        }
+        static int slow_logs = 0;
+        if (slow_logs < 4)
+        {
+            slow_logs++;
+            fprintf(stderr, "zQP_post_send_async slow path device=%d unique_cas=%d opcode=%d\n",
+                    zqp->current_device, (int)unique_cas,
+                    send_wr != NULL ? (int)send_wr->opcode : -1);
+        }
                 vector<ibv_send_wr*> copy_wrs;
         vector<ibv_sge*> copy_sges;
         vector<zWR_entry*> wr_entries;

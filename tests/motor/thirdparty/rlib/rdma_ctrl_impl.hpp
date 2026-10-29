@@ -1,10 +1,31 @@
 #include <pthread.h>
 
+#include <cstdint>
 #include <map>
 #include <mutex>
 
 
 namespace zrdma {
+
+// Last IPv4-mapped GID is RoCEv2 on ConnectX (index 3 when both v1 and v2 are installed).
+static int pick_rocev2_gid_index(ibv_context* ctx, uint8_t port) {
+  int chosen = 0;
+  for (int i = 0; i < 16; ++i) {
+    ibv_gid gid{};
+    if (ibv_query_gid(ctx, port, i, &gid) != 0) continue;
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(gid.raw);
+    bool v4mapped = true;
+    for (int b = 0; b < 10; ++b) {
+      if (raw[b] != 0) {
+        v4mapped = false;
+        break;
+      }
+    }
+    if (raw[10] != 0xff || raw[11] != 0xff) v4mapped = false;
+    if (v4mapped) chosen = i;
+  }
+  return chosen;
+}
 
 /**
  * Simple critical section
@@ -126,7 +147,14 @@ class RdmaCtrl::RdmaCtrlImpl {
 
     // success open
     {
-      rnic = new RNicHandler(idx.dev_id, idx.port_id, ib_ctx, pd, port_attr.lid);
+      int gid_index = 0;
+      if (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET) {
+        gid_index = pick_rocev2_gid_index(ib_ctx, idx.port_id);
+      }
+      rnic = new RNicHandler(idx.dev_id, idx.port_id, ib_ctx, pd, port_attr.lid, gid_index);
+      if (port_attr.active_mtu >= IBV_MTU_256 && port_attr.active_mtu <= IBV_MTU_4096) {
+        rnic->active_mtu = static_cast<enum ibv_mtu>(port_attr.active_mtu);
+      }
     }
 
     OPEN_END:

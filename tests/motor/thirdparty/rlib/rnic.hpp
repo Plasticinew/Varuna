@@ -129,7 +129,8 @@ struct RNicHandler {
                                                                                              ctx(ctx),
                                                                                              pd(pd),
                                                                                              lid(lid),
-                                                                                             gid(gid) {
+                                                                                             gid(gid),
+                                                                                             active_mtu(IBV_MTU_1024) {
   }
 
   address_t query_addr() {
@@ -164,6 +165,7 @@ struct RNicHandler {
   struct ibv_pd* pd;
   uint16_t lid;
   uint16_t gid;
+  enum ibv_mtu active_mtu;
 };
 
 }  // namespace zrdma

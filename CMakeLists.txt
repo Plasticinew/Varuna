@@ -2,7 +2,9 @@ cmake_minimum_required(VERSION 3.2)
 
 project(RDMAnager)
 
-set(CMAKE_BUILD_TYPE "Debug")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
 set(RDMA_LIB "-lrdmacm -libverbs")
 set(CMAKE_CXX_FLAGS "-std=c++17 ${CMAKE_CXX_FLAGS} -fPIC")

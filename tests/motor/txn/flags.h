@@ -55,5 +55,7 @@
 #define PRIMARY_CRASH -33
 #define BACKUP_CRASH -13
 
+#ifndef USE_ZRDMA
 #define USE_ZRDMA 1
+#endif
 #define NETWORK_CRASH 0

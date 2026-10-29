@@ -16,6 +16,13 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -DDEBUG -g")
 endif()
 
+option(MOTOR_USE_ZRDMA "Build the Varuna zQP data path instead of native rlib" ON)
+if(MOTOR_USE_ZRDMA)
+  add_compile_definitions(USE_ZRDMA=1)
+else()
+  add_compile_definitions(USE_ZRDMA=0)
+endif()
+
 include_directories(
     txn
     workload

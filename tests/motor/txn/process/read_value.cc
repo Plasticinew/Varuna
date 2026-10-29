@@ -5,6 +5,17 @@
 
 #include "process/txn.h"
 
+// The original loop kept testing the same slot, so a missing next version
+// spun forever and the thread never finished the benchmark.
+static bool next_valid_vcell(const CVT* cvt, int read_pos, int& next_pos) {
+  next_pos = (read_pos + 1) % MAX_VCELL_NUM;
+  for (int scanned = 0; scanned < MAX_VCELL_NUM - 1; ++scanned) {
+    if (cvt->vcell[next_pos].valid) return true;
+    next_pos = (next_pos + 1) % MAX_VCELL_NUM;
+  }
+  return false;
+}
+
 // --------------- Reading Full Data Value and Attributes -----------------
 bool TXN::ReadValueRO(RCQP* qp,
                       CVT* fetched_cvt,
@@ -174,9 +185,7 @@ bool TXN::ReadValueRW(RCQP* qp,
       // event_counter.RegEvent(t_id, txn_name, "ReadValueRW:NotReadNewest:Update");
 
       int next_pos;
-      do {
-        next_pos = (read_pos + 1) % MAX_VCELL_NUM;
-      } while (!(fetched_cvt->vcell[next_pos].valid));
+      if (!next_valid_vcell(fetched_cvt, read_pos, next_pos)) return false;
 
       std::vector<AttrRead> attr_read_list;
 
@@ -405,9 +414,7 @@ bool TXN::LockReadValueRW(RCQP* qp,
       // event_counter.RegEvent(t_id, txn_name, "LockReadValueRW:NotReadNewest:Update");
 
       int next_pos;
-      do {
-        next_pos = (read_pos + 1) % MAX_VCELL_NUM;
-      } while (!(fetched_cvt->vcell[next_pos].valid));
+      if (!next_valid_vcell(fetched_cvt, read_pos, next_pos)) return false;
 
       std::vector<AttrRead> attr_read_list;
 

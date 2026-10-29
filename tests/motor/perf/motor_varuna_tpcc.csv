@@ -1,0 +1,9 @@
+system,benchmark,isolation,threads,coroutines,attempted_num,attempted_ktps,committed_ktps,p50_us,p99_us
+motor_native,tpcc,SI,2,2,5000,4.5994,4.59246,193.408,4493.27
+motor_native,tpcc,SI,4,2,5000,9.40506,9.35102,195.848,4534.74
+motor_native,tpcc,SI,8,2,5000,19.6733,19.3507,184.455,4629.61
+motor_native,tpcc,SI,16,2,5000,36.485,35.2864,203.227,5355.18
+motor_varuna,tpcc,SI,2,2,5000,4.44747,4.43688,199.839,4649.72
+motor_varuna,tpcc,SI,4,2,5000,9.12106,9.06235,201.027,4684.74
+motor_varuna,tpcc,SI,8,2,5000,19.1336,18.8205,191.861,4697.39
+motor_varuna,tpcc,SI,16,2,5000,35.4721,34.2807,211.097,5428.99

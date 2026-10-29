@@ -178,7 +178,7 @@ class RCQPImpl {
     struct ibv_qp_attr qp_attr = {};
 
     qp_attr.qp_state = IBV_QPS_RTR;
-    qp_attr.path_mtu = IBV_MTU_4096;
+    qp_attr.path_mtu = rnic->active_mtu;
     qp_attr.dest_qp_num = attr.qpn;
     qp_attr.rq_psn = config.rq_psn;  // should this match the sender's psn ?
     qp_attr.max_dest_rd_atomic = config.max_dest_rd_atomic;
@@ -192,7 +192,7 @@ class RCQPImpl {
     qp_attr.ah_attr.is_global = 1;
     qp_attr.ah_attr.grh.dgid.global.subnet_prefix = attr.addr.subnet_prefix;
     qp_attr.ah_attr.grh.dgid.global.interface_id = attr.addr.interface_id;
-    qp_attr.ah_attr.grh.sgid_index = 0;
+    qp_attr.ah_attr.grh.sgid_index = rnic->gid;
     qp_attr.ah_attr.grh.flow_label = 0;
     qp_attr.ah_attr.grh.hop_limit = 255;
 
@@ -213,7 +213,7 @@ class RCQPImpl {
     struct ibv_qp_attr qp_attr = {};
 
     qp_attr.qp_state = IBV_QPS_RTR;
-    qp_attr.path_mtu = IBV_MTU_4096;
+    qp_attr.path_mtu = rnic->active_mtu;
     qp_attr.dest_qp_num = attr.qpn;
     qp_attr.rq_psn = config.rq_psn;  // should this match the sender's psn ?
     qp_attr.max_dest_rd_atomic = config.max_dest_rd_atomic;
@@ -227,7 +227,7 @@ class RCQPImpl {
     qp_attr.ah_attr.is_global = 1;
     qp_attr.ah_attr.grh.dgid.global.subnet_prefix = attr.addr.subnet_prefix;
     qp_attr.ah_attr.grh.dgid.global.interface_id = attr.addr.interface_id;
-    qp_attr.ah_attr.grh.sgid_index = 0;
+    qp_attr.ah_attr.grh.sgid_index = rnic->gid;
     qp_attr.ah_attr.grh.flow_label = 0;
     qp_attr.ah_attr.grh.hop_limit = 255;
 

@@ -13,7 +13,7 @@
   },
   "remote_mem_nodes": {
     "remote_ips": [
-      "10.10.1.2"
+      "10.10.1.3"
     ],
     "remote_ports": [
       12346
