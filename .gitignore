@@ -1,0 +1,21 @@
+# Local CMake builds
+/build/
+tests/motor/build-native/
+tests/motor/build-varuna/
+tests/gpu_semantic/build/
+
+# Motor benchmark logs and profiles
+tests/motor/perf/logs/
+tests/motor/bench_results/
+*.prof
+
+# Compiler and editor leftovers
+*.o
+*.obj
+*.d
+*.pyc
+__pycache__/
+.cache/
+*.swp
+*~
+.DS_Store
