@@ -42,6 +42,8 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
 #define RDMA_TIMEOUT_US (uint64_t)10000000
 // #define RETRY_TIMEOUT 0
 #define RETRY_TIMEOUT 0
+// 4.096 us << 18 = 1.07 s. retry_count is 0, so a lost ACK fails once, at this bound.
+#define RC_ACK_TIMEOUT 18
 #define MAX_REQUESTOR_NUM 16383
 #define MAX_REMOTE_SIZE (1UL << 25)
 
@@ -93,7 +95,8 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
         ZSTATUS_INIT,
         ZSTATUS_CONNECTED,
         ZSTATUS_ACCEPTED,
-        ZSTATUS_ERROR
+        ZSTATUS_ERROR,
+        ZSTATUS_ROUTE_RESOLVED
     };
 
     // Device Info
@@ -231,6 +234,9 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
         uint8_t gid_index_;
         uint16_t lid_;
         uint32_t dct_num_;
+        // Signaled doorbells posted and not yet harvested. Updates sit under lock;
+        // the poll path reads it to skip the DCI CQ once the window has drained.
+        std::atomic<int> inflight{0};
         std::mutex lock;
     };
 
@@ -250,6 +256,8 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
         uint8_t gid_index_;
         uint16_t lid_;
         uint32_t dct_num_;
+        void *srq_buf_ = NULL;
+        ibv_mr *srq_mr_ = NULL;
     };
 
     struct zPD
@@ -260,7 +268,7 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
         vector<vector<zDCQP_requestor *>> m_requestors;
         vector<vector<zDCQP_responder *>> m_responders;
         std::mutex pd_mutex;
-        std::atomic<int> bound_dcqps_{0};
+        int next_dci_ = 0;
         uint32_t m_fast_lkey = 0;
     };
 
@@ -514,7 +522,8 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
         uint32_t quick_rkey = 0;
         uint32_t quick_lkey = 0;
         uint32_t *m_fast_rkey = nullptr;
-        int bound_dcqps_ = 0;
+        // Index of this QP's DCI in zPD::m_requestors. One DCI per data RC.
+        int dcqp_index_ = 0;
         tbb::concurrent_vector<zQP_requestor *> m_requestors;
         unordered_map<int, zTarget *> m_targets;
         int primary_device = 0;
@@ -525,6 +534,10 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
         unordered_map<int, ibv_mr *> msg_mr_;
         unordered_map<int, ibv_mr *> resp_mr_;
         zWR_entry wr_entry_[WR_ENTRY_NUM];
+        // Bytes the application posted, kept so a replay does not send
+        // whatever the coroutine buffer holds after it has been reused.
+        void *payload_copy_[WR_ENTRY_NUM] = {};
+        uint32_t payload_len_[WR_ENTRY_NUM] = {};
         ibv_send_wr wr_[WR_ENTRY_NUM];
         ibv_send_wr wr_backup[WR_ENTRY_NUM];
         ibv_sge sge_[WR_ENTRY_NUM];
@@ -536,6 +549,10 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
         std::mutex recovery_mutex;
         std::mutex recovered_mu_;
         std::vector<uint64_t> recovered_wr_ids_;
+        // Signaled wr_id of the DCQP doorbell a synchronous poll should consume.
+        // Async polls take the same id from recovered_wr_ids_.
+        uint64_t dc_posted_wr_id_ = 0;
+        std::atomic<int> backup_connect_started_{0};
         std::atomic<uint64_t> size_counter_{0};
         zQPType qp_type;
         int qp_id_ = 0;
@@ -547,6 +564,8 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
 
     zEndpoint *zEP_create(string config_file);
     zPD *zPD_create(zEndpoint *ep, int pool_size);
+    // Give this QP its own DCI on every NIC. The first call reuses pool slot 0.
+    int zQP_bind_dci(zQP *qp);
     zQP *zQP_create(zPD *pd, zEndpoint *ep, rkeyTable *table, zQPType qp_type);
     void zEP_destroy(zEndpoint *ep);
     void zPD_destroy(zPD *pd);
@@ -557,7 +576,7 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
     int zDCQP_read(zDCQP_requestor *requestor, ibv_ah *ah, void *local_addr, uint32_t lkey, uint64_t length, void *remote_addr, uint32_t rkey, uint32_t lid, uint32_t dct_num);
     int zDCQP_write(zDCQP_requestor *requestor, ibv_ah *ah, void *local_addr, uint32_t lkey, uint64_t length, void *remote_addr, uint32_t rkey, uint32_t lid, uint32_t dct_num);
     int zDCQP_CAS(zDCQP_requestor *requestor, ibv_ah *ah, void *local_addr, uint32_t lkey, uint64_t new_val, void *remote_addr, uint32_t rkey, uint32_t lid, uint32_t dct_num);
-    int zDCQP_send(zQP *zqp, zDCQP_requestor *requestor, ibv_ah *ah, ibv_send_wr *send_wr, uint32_t lid, uint32_t dct_num, int max_depth=-1);
+    int zDCQP_send(zQP *zqp, zDCQP_requestor *requestor, ibv_ah *ah, ibv_send_wr *send_wr, uint32_t lid, uint32_t dct_num, int max_depth=-1, bool wait=true);
 
     zDCQP_responder *zDCQP_create_responder(zDevice *device, ibv_pd *pd);
     zQP_listener *zQP_listener_create(zPD *pd, zEndpoint *ep);
@@ -612,6 +631,9 @@ const uint64_t magic_number = 0xdeadbeefcafebabe;
         uint32_t time_stamp, bool unique_cas, int max_depth=-1);
     int z_poll_completion(zQP *qp, vector<uint64_t> *wr_ids);
     int z_poll_completion(zQP *qp, uint64_t wr_id);
+    // Drop completions still queued for a coroutine that has already observed
+    // every doorbell it posted. Called only once its pending count hits 0.
+    void z_discard_recovered(zQP *qp, uint64_t wr_id);
 
     int load_config(const char *fname, struct zDeviceConfig *config);
     int load_config(const char *fname, struct zTargetConfig *config);

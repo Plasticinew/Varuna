@@ -45,9 +45,13 @@ bool TxOrderStatus(TPCC* tpcc_client,
                    TXN* txn);
 
 bool TxStockLevel(TPCC* tpcc_client,
-                  FastRandom* random_generator,
-                  coro_yield_t& yield,
-                  tx_id_t tx_id,
-                  TXN* txn);
+                 FastRandom* random_generator,
+                 coro_yield_t& yield,
+                 tx_id_t tx_id,
+                 TXN* txn);
+
+// After every worker has stopped committing. Reads through the live QP and
+// prints TPCC_CHECK / TPCC_CHECK_FAIL. Does not abort the process.
+void CheckTpccConsistency(TPCC* tpcc_client, coro_yield_t& yield, TXN* txn);
 
 /******************** The business logic (Transaction) end ********************/

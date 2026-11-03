@@ -30,6 +30,7 @@ struct TpProbe {
   int ctr;
   double tp;
   double attemp_tp;
+  uint64_t t_ns;
 };
 
 void run_thread(thread_params* params,

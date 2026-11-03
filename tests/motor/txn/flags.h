@@ -47,7 +47,9 @@
 #define OUTPUT_KEY_STAT 0
 
 /*********************** Crash test only **********************/
+#ifndef PROBE_TP
 #define PROBE_TP 0  // Probing throughput during execution
+#endif
 #define HAVE_COORD_CRASH 0
 #define HAVE_PRIMARY_CRASH 0
 #define HAVE_BACKUP_CRASH 0

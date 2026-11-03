@@ -31,12 +31,11 @@ public:
         zQP_connect(rpc_qp_, 0, ip, port);
         qp_ = zQP_create(pd_, ep_, rkey_table_, ZQP_ONESIDED);
         qp_->m_fast_rkey = m_fast_rkey_;
-        qp_->bound_dcqps_ = pd_->bound_dcqps_.fetch_add(1);
+        zQP_bind_dci(qp_);
         zQP_connect(qp_, 0, ip, port);
-        if (qp_->m_targets.find(1) != qp_->m_targets.end() && qp_->m_targets[1] != NULL)
-        {
-            zQP_connect(qp_, 1, qp_->m_targets[1]->ip, qp_->m_targets[1]->port);
-        }
+        // Leave the backup RC unconnected. After failover, z_switch rebuilds
+        // it in the background. Traffic in that window goes through DCQP,
+        // and writes carry a completion-log WRITE instead of immediate data.
         zQP_RPC_GetAddr(rpc_qp_, &remote_mr_.buf, &remote_mr_.key);
         local_mr_.buf = local_addr;
         local_mr_.key = lkey;
@@ -68,8 +67,8 @@ public:
         sr.wr.rdma.rkey = remote_mr_.key;
         // RDMA_LOG(INFO) << "post_send opcode: " << op << ", local_buf: " << (void*)sge.addr << ", len: " << sge.length 
         //               << ", remote_addr: " << sr.wr.rdma.remote_addr << ", rkey: " << sr.wr.rdma.rkey << ", wr_id: " << wr_id;
-        z_post_send_async(qp_, &sr, &bad_sr, true, 0, nullptr, false, -1, wr_id);
-        return SUCC;
+        int rc = z_post_send_async(qp_, &sr, &bad_sr, true, 0, nullptr, false, -1, wr_id);
+        return rc == 0 ? SUCC : ERR;
     }
 
     ConnStatus post_batch(struct ibv_send_wr* send_sr, ibv_send_wr** bad_sr_addr, int num = 0) {
@@ -104,6 +103,12 @@ public:
         // if(result > 0)
             // RDMA_LOG(INFO) << "poll send completion result: " << result;
         return result;
+    }
+
+    // The coroutine has observed one completion per doorbell. Anything still
+    // queued for it is from recovery and would finish the next read early.
+    void discard_recovered(uint64_t wr_id) {
+        z_discard_recovered(qp_, wr_id);
     }
 
     mr local_mr_;

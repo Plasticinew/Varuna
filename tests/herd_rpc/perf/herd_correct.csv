@@ -1,0 +1,4 @@
+system,trials,correct,duplicate,lost,mismatch
+herd_native,640,640,0,0,0
+herd_blind,640,0,640,0,0
+herd_varuna,640,640,0,0,0

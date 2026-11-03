@@ -2,11 +2,14 @@
 /build/
 tests/motor/build-native/
 tests/motor/build-varuna/
+tests/motor/build-varuna-probe/
+tests/herd_rpc/build/
 tests/gpu_semantic/build/
 
 # Motor benchmark logs and profiles
 tests/motor/perf/logs/
 tests/motor/bench_results/
+tests/herd_rpc/perf/logs/
 *.prof
 
 # Compiler and editor leftovers

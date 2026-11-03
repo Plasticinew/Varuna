@@ -271,9 +271,12 @@ void CoroutineScheduler::PollCompletion(t_id_t tid) {
     }
     auto coro_id = wc.wr_id;
     if (coro_id == 0) continue;
-    assert(pending_counts[coro_id] > 0);
+    if (pending_counts[coro_id] <= 0) {
+      RDMA_LOG(FATAL) << "extra completion coro=" << coro_id << " pending=" << pending_counts[coro_id] << " wr_id=" << wc.wr_id;
+    }
     pending_counts[coro_id] -= 1;
     if (pending_counts[coro_id] == 0) {
+      qp->discard_recovered(coro_id);
       AppendCoroutine(&coro_array[coro_id]);
     }
     it = pending_qps.erase(it);

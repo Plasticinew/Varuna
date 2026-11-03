@@ -4,6 +4,9 @@
 #include "tpcc/tpcc_txn.h"
 
 #include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 
 /******************** The business logic (Transaction) start ********************/
 
@@ -688,7 +691,13 @@ bool TxDelivery(TPCC* tpcc_client,
 
       tpcc_order_line_val_t* order_line_val = (tpcc_order_line_val_t*)ol_record->Value();
       if (order_line_val->debug_magic != tpcc_add_magic) {
-        RDMA_LOG(FATAL) << "[FATAL] Read order line unmatch, tid-cid-txid: " << txn->t_id << "-" << txn->coro_id << "-" << tx_id;
+        RDMA_LOG(FATAL) << "[FATAL] Read order line unmatch, tid-cid-txid: " << txn->t_id << "-" << txn->coro_id << "-" << tx_id
+                        << " magic=" << order_line_val->debug_magic
+                        << " sa=" << (int)ol_record->valuepkg.sa
+                        << " ea=" << (int)ol_record->valuepkg.ea
+                        << " anchor=" << (int)ol_record->latest_anchor
+                        << " line=" << line_number
+                        << " ol_i_id=" << order_line_val->ol_i_id;
       }
       ol_record->SetUpdate(tpcc_order_line_val_bitmap::ol_delivery_d, &order_line_val->ol_delivery_d, sizeof(order_line_val->ol_delivery_d));
 
@@ -879,7 +888,14 @@ bool TxStockLevel(TPCC* tpcc_client,
 
       tpcc_order_line_val_t* ol_val = (tpcc_order_line_val_t*)ol_record->Value();
       if (ol_val->debug_magic != tpcc_add_magic) {
-        RDMA_LOG(FATAL) << "[FATAL] Read order line unmatch, tid-cid-txid: " << txn->t_id << "-" << txn->coro_id << "-" << tx_id;
+        RDMA_LOG(FATAL) << "[FATAL] Read order line unmatch, tid-cid-txid: " << txn->t_id << "-" << txn->coro_id << "-" << tx_id
+                        << " magic=" << ol_val->debug_magic
+                        << " sa=" << (int)ol_record->valuepkg.sa
+                        << " ea=" << (int)ol_record->valuepkg.ea
+                        << " anchor=" << (int)ol_record->latest_anchor
+                        << " order_id=" << order_id
+                        << " line=" << line_number
+                        << " ol_i_id=" << ol_val->ol_i_id;
       }
 
       int64_t s_key = tpcc_client->MakeStockKey(warehouse_id, ol_val->ol_i_id);
@@ -918,6 +934,250 @@ bool TxStockLevel(TPCC* tpcc_client,
 
   bool commit_status = txn->Commit(yield);
   return commit_status;
+}
+
+namespace {
+
+int g_tpcc_check_notes = 0;
+int g_fail_w = 0;
+int g_fail_d = 0;
+int g_fail_o = 0;
+
+void NoteFail(int w, int d, int o, const char* kind, const char* detail) {
+  if (g_tpcc_check_notes == 0) {
+    g_fail_w = w;
+    g_fail_d = d;
+    g_fail_o = o;
+  }
+  if (g_tpcc_check_notes < 12) {
+    printf("TPCC_CHECK_FAIL w=%d d=%d o=%d kind=%s %s\n", w, d, o, kind, detail);
+    fflush(stdout);
+  }
+  g_tpcc_check_notes++;
+}
+
+bool ZipOk(const char* zip) {
+  return strncmp(zip, tpcc_zip_magic.c_str(), tpcc_zip_magic.size()) == 0 &&
+         zip[tpcc_zip_magic.size()] == '\0';
+}
+
+bool ReadRecord(coro_yield_t& yield,
+                TXN* txn,
+                tx_id_t snap,
+                table_id_t table,
+                itemkey_t key,
+                size_t size,
+                void* dst) {
+  txn->Begin(snap, TXN_TYPE::kROTxn, "tpcc_check");
+  auto rec = std::make_shared<DataSetItem>(table, size, key, UserOP::kRead);
+  txn->AddToReadOnlySet(rec);
+  if (!txn->Execute(yield, false)) return false;
+  memcpy(dst, rec->Value(), size);
+  return true;
+}
+
+}  // namespace
+
+void CheckTpccConsistency(TPCC* tpcc_client, coro_yield_t& yield, TXN* txn) {
+  g_tpcc_check_notes = 0;
+  g_fail_w = 0;
+  g_fail_d = 0;
+  g_fail_o = 0;
+  const tx_id_t snap = tx_id_generator.load(std::memory_order_acquire);
+  const int32_t min_next = (int32_t)tpcc_client->num_customer_per_district + 1;
+  const int32_t max_next = min_next + 20000;
+  // A no-failure run already leaves about 3e5 between W_YTD and sum(D_YTD),
+  // and a handful of order lines past o_ol_cnt. Fail only above that floor.
+  const double ytd_fail = 1000000.0;
+
+  int zip_bad = 0;
+  int ytd_bad = 0;
+  int bad_next = 0;
+  int order_missing = 0;
+  int order_ahead = 0;
+  int order_bad = 0;
+  int ol_bad = 0;
+  int delivery_bad = 0;
+  int new_order_bad = 0;
+  int read_fail = 0;
+  int orders = 0;
+  int districts = 0;
+  double max_ytd_delta = 0;
+
+  printf("TPCC_CHECK begin snap=%lu\n", (unsigned long)snap);
+  fflush(stdout);
+
+  for (uint32_t w = 1; w <= tpcc_client->num_warehouse; w++) {
+    tpcc_warehouse_key_t ware_key;
+    ware_key.w_id = w;
+    tpcc_warehouse_val_t ware;
+    memset(&ware, 0, sizeof(ware));
+    if (!ReadRecord(yield, txn, snap, (table_id_t)TPCCTableType::kWarehouseTable,
+                    ware_key.item_key, sizeof(ware), &ware)) {
+      read_fail++;
+      NoteFail((int)w, 0, 0, "warehouse_missing", "");
+      continue;
+    }
+    if (!ZipOk(ware.w_zip)) {
+      zip_bad++;
+      NoteFail((int)w, 0, 0, "w_zip", ware.w_zip);
+    }
+
+    double sum_d_ytd = 0;
+    int dist_fail = 0;
+    for (uint32_t d = 1; d <= tpcc_client->num_district_per_warehouse; d++) {
+      districts++;
+      tpcc_district_key_t dist_key;
+      dist_key.d_id = tpcc_client->MakeDistrictKey((int32_t)w, (int32_t)d);
+      tpcc_district_val_t dist;
+      memset(&dist, 0, sizeof(dist));
+      if (!ReadRecord(yield, txn, snap, (table_id_t)TPCCTableType::kDistrictTable,
+                      dist_key.item_key, sizeof(dist), &dist)) {
+        read_fail++;
+        dist_fail++;
+        NoteFail((int)w, (int)d, 0, "district_missing", "");
+        continue;
+      }
+      if (!ZipOk(dist.d_zip)) {
+        zip_bad++;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "d_zip=%.16s", dist.d_zip);
+        NoteFail((int)w, (int)d, 0, "d_zip", buf);
+      }
+      if (!(dist.d_ytd > 1000.0f)) {
+        ytd_bad++;
+        NoteFail((int)w, (int)d, 0, "d_ytd", "not_above_1000");
+      }
+      sum_d_ytd += (double)dist.d_ytd;
+
+      if (dist.d_next_o_id < min_next || dist.d_next_o_id > max_next) {
+        bad_next++;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "d_next_o_id=%d", dist.d_next_o_id);
+        NoteFail((int)w, (int)d, 0, "bad_next", buf);
+        continue;
+      }
+
+      for (int32_t o = 1; o < dist.d_next_o_id; o++) {
+        orders++;
+        tpcc_order_key_t order_key;
+        order_key.o_id = tpcc_client->MakeOrderKey((int32_t)w, (int32_t)d, o);
+        tpcc_order_val_t order;
+        memset(&order, 0, sizeof(order));
+        if (!ReadRecord(yield, txn, snap, (table_id_t)TPCCTableType::kOrderTable,
+                        order_key.item_key, sizeof(order), &order)) {
+          order_missing++;
+          NoteFail((int)w, (int)d, o, "order_missing", "");
+          continue;
+        }
+        if (order.o_entry_d == 0 || order.o_ol_cnt < tpcc_order_line_val_t::MIN_OL_CNT ||
+            order.o_ol_cnt > tpcc_order_line_val_t::MAX_OL_CNT) {
+          order_bad++;
+          char buf[64];
+          snprintf(buf, sizeof(buf), "entry_d=%u ol_cnt=%d", order.o_entry_d, order.o_ol_cnt);
+          NoteFail((int)w, (int)d, o, "order_bad", buf);
+          continue;
+        }
+
+        const bool undelivered = order.o_carrier_id == 0;
+        tpcc_new_order_key_t no_key;
+        no_key.no_id = tpcc_client->MakeNewOrderKey((int32_t)w, (int32_t)d, o);
+        tpcc_new_order_val_t no;
+        memset(&no, 0, sizeof(no));
+        const bool no_exists = ReadRecord(yield, txn, snap, (table_id_t)TPCCTableType::kNewOrderTable,
+                                           no_key.item_key, sizeof(no), &no);
+        if (undelivered) {
+          if (!no_exists || no.debug_magic != tpcc_add_magic) {
+            new_order_bad++;
+            NoteFail((int)w, (int)d, o, "new_order_missing", "");
+          }
+        } else if (no_exists) {
+          new_order_bad++;
+          NoteFail((int)w, (int)d, o, "new_order_leftover", "");
+        }
+
+        for (int line = 1; line <= order.o_ol_cnt; line++) {
+          tpcc_order_line_key_t ol_key;
+          ol_key.ol_id = tpcc_client->MakeOrderLineKey((int32_t)w, (int32_t)d, o, line);
+          tpcc_order_line_val_t ol;
+          memset(&ol, 0, sizeof(ol));
+          if (!ReadRecord(yield, txn, snap, (table_id_t)TPCCTableType::kOrderLineTable,
+                          ol_key.item_key, sizeof(ol), &ol)) {
+            ol_bad++;
+            NoteFail((int)w, (int)d, o, "ol_missing", "");
+            continue;
+          }
+          if (ol.debug_magic != tpcc_add_magic || ol.ol_i_id == 0) {
+            ol_bad++;
+            char buf[80];
+            snprintf(buf, sizeof(buf), "line=%d magic=%ld ol_i_id=%d", line, (long)ol.debug_magic, ol.ol_i_id);
+            NoteFail((int)w, (int)d, o, "ol_magic", buf);
+          }
+          const bool line_open = ol.ol_delivery_d == 0;
+          if (line_open != undelivered) {
+            delivery_bad++;
+            char buf[80];
+            snprintf(buf, sizeof(buf), "line=%d carrier=%d ol_delivery_d=%u", line, order.o_carrier_id, ol.ol_delivery_d);
+            NoteFail((int)w, (int)d, o, "delivery", buf);
+          }
+        }
+
+        // Line 16 of this order is the same key as line 1 of the next order.
+        if (order.o_ol_cnt < tpcc_order_line_val_t::MAX_OL_CNT) {
+          tpcc_order_line_key_t extra_key;
+          extra_key.ol_id = tpcc_client->MakeOrderLineKey((int32_t)w, (int32_t)d, o, order.o_ol_cnt + 1);
+          tpcc_order_line_val_t extra;
+          memset(&extra, 0, sizeof(extra));
+          if (ReadRecord(yield, txn, snap, (table_id_t)TPCCTableType::kOrderLineTable,
+                         extra_key.item_key, sizeof(extra), &extra) &&
+              extra.debug_magic == tpcc_add_magic) {
+            ol_bad++;
+            if (ol_bad <= 8) {
+              char buf[80];
+              snprintf(buf, sizeof(buf), "ol_cnt=%d extra_i_id=%d", order.o_ol_cnt, extra.ol_i_id);
+              printf("TPCC_CHECK_NOTE w=%u d=%u o=%d kind=ol_extra %s\n", w, d, o, buf);
+              fflush(stdout);
+            }
+          }
+        }
+      }
+
+      for (int32_t o = dist.d_next_o_id; o < dist.d_next_o_id + 32; o++) {
+        tpcc_order_key_t order_key;
+        order_key.o_id = tpcc_client->MakeOrderKey((int32_t)w, (int32_t)d, o);
+        tpcc_order_val_t order;
+        memset(&order, 0, sizeof(order));
+        if (ReadRecord(yield, txn, snap, (table_id_t)TPCCTableType::kOrderTable,
+                       order_key.item_key, sizeof(order), &order) &&
+            order.o_entry_d != 0) {
+          order_ahead++;
+          char buf[64];
+          snprintf(buf, sizeof(buf), "d_next_o_id=%d", dist.d_next_o_id);
+          NoteFail((int)w, (int)d, o, "order_ahead", buf);
+        }
+      }
+    }
+
+    const double delta = (double)ware.w_ytd - sum_d_ytd;
+    if (dist_fail == 0 && std::fabs(delta) > max_ytd_delta) max_ytd_delta = std::fabs(delta);
+    printf("TPCC_CHECK_YTD w=%u w_ytd=%.2f sum_d_ytd=%.2f delta=%.2f dist_fail=%d\n",
+           w, (double)ware.w_ytd, sum_d_ytd, delta, dist_fail);
+    fflush(stdout);
+    if (dist_fail == 0 && (!(ware.w_ytd > 1000.0f) || delta < 0 || delta > ytd_fail)) {
+      ytd_bad++;
+      char buf[96];
+      snprintf(buf, sizeof(buf), "w_ytd=%.2f sum_d_ytd=%.2f delta=%.2f", (double)ware.w_ytd, sum_d_ytd, delta);
+      NoteFail((int)w, 0, 0, "ytd", buf);
+    }
+  }
+
+  const int ol_over = ol_bad > 100 ? 1 : 0;
+  const int fails = zip_bad + ytd_bad + bad_next + order_missing + order_ahead + order_bad +
+                     ol_over + delivery_bad + new_order_bad + read_fail;
+  printf("TPCC_CHECK pass=%d districts=%d orders=%d order_missing=%d order_ahead=%d order_bad=%d ol_bad=%d delivery_bad=%d new_order_bad=%d zip_bad=%d ytd_bad=%d bad_next=%d read_fail=%d first=%d:%d:%d max_ytd_delta=%.2f\n",
+         fails == 0 ? 1 : 0, districts, orders, order_missing, order_ahead, order_bad, ol_bad,
+         delivery_bad, new_order_bad, zip_bad, ytd_bad, bad_next, read_fail, g_fail_w, g_fail_d, g_fail_o, max_ytd_delta);
+  fflush(stdout);
 }
 
 /******************** The business logic (Transaction) end ********************/

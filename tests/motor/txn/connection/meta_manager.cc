@@ -97,7 +97,9 @@ MetaManager::MetaManager() {
         fast_rkey_table_[i] = new uint32_t();
     }
     ep_ = zEP_create("../../../config/zrdma_client_config.json");
-    pd_ = zPD_create(ep_, 16);
+    // Slot 0 exists so the first connect can build an address handle.
+    // Each data RC then binds its own DCI, one per QP.
+    pd_ = zPD_create(ep_, 1);
     load_config("../../../config/target_config.json", &config);
 #endif
 

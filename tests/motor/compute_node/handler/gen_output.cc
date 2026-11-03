@@ -3,11 +3,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #include "handler/handler.h"
@@ -52,17 +55,59 @@ std::atomic<bool> during_backup_recovery;
 std::atomic<int> probe_times;
 std::atomic<bool> probe[MAX_TNUM_PER_CN];
 std::vector<std::vector<TpProbe>> tp_probe_vec;
+std::mutex tp_probe_mu;
 std::atomic<bool> is_running;
+
+struct ProbeAgg {
+  double tp = 0;
+  uint64_t t_ns = 0;
+};
+
+// Rewrite the snapshot while workers are still running. A failover client
+// can stay blocked in completion polling, and the end-of-run writer then
+// never runs.
+static void write_probe_snapshot(const std::string& path) {
+  std::map<int, ProbeAgg> figure;
+  {
+    std::lock_guard<std::mutex> lock(tp_probe_mu);
+    for (int i = 0; i < (int)tp_probe_vec.size(); i++) {
+      for (int j = 0; j < (int)tp_probe_vec[i].size(); j++) {
+        ProbeAgg& agg = figure[tp_probe_vec[i][j].ctr];
+        agg.tp += tp_probe_vec[i][j].tp;
+        if (agg.t_ns == 0 || tp_probe_vec[i][j].t_ns < agg.t_ns) {
+          agg.t_ns = tp_probe_vec[i][j].t_ns;
+        }
+      }
+    }
+  }
+  std::string tmp = path + ".tmp";
+  std::ofstream out(tmp.c_str(), std::ios::out);
+  out << "t_ns committed_ktps\n";
+  for (auto& item : figure) {
+    out << item.second.t_ns << " " << item.second.tp / 1000.0 << "\n";
+  }
+  out.close();
+  if (!out) {
+    return;
+  }
+  std::rename(tmp.c_str(), path.c_str());
+}
 
 /////////////////////////////////////////////////////////
 
 void TimeStop(t_id_t thread_num_per_machine, int tp_probe_interval_us) {
+  const char* snapshot = std::getenv("VARUNA_PROBE_SNAPSHOT");
+  int ticks = 0;
   while (is_running) {
     usleep(tp_probe_interval_us);
     for (int i = 0; i < thread_num_per_machine; i++) {
       probe[i] = true;
     }
     probe_times++;
+    // About 200 ms at the 5 ms failover interval.
+    if (snapshot != nullptr && snapshot[0] != '\0' && ++ticks % 40 == 0) {
+      write_probe_snapshot(snapshot);
+    }
   }
 }
 
@@ -459,8 +504,7 @@ void Handler::OutputResult(std::string bench_name, std::string system_name) {
 #endif
 
 #if PROBE_TP
-  std::map<int, double> tp_time_figure;
-  std::map<int, double> attemp_tp_time_figure;
+  std::map<int, ProbeAgg> tp_time_figure;
 
   std::ofstream of_probe_tp;
   time_t rawtime;
@@ -474,44 +518,27 @@ void Handler::OutputResult(std::string bench_name, std::string system_name) {
     s = std::to_string(ptminfo->tm_year + 1900) + "-" + std::to_string(ptminfo->tm_mon + 1) + "-" + std::to_string(ptminfo->tm_mday) + "@" + std::to_string(ptminfo->tm_hour) + ":" + std::to_string(ptminfo->tm_min) + ":" + std::to_string(ptminfo->tm_sec);
   }
 
+  std::string results_probe_cmd = "mkdir -p ../../../bench_results/crash_tests/" + bench_name;
+  system(results_probe_cmd.c_str());
   std::string probe_file = "../../../bench_results/crash_tests/" + bench_name + "/tp_probe@" + system_name + "@" + s + ".txt";
   of_probe_tp.open(probe_file.c_str(), std::ios::out);
-  for (int i = 0; i < tp_probe_vec.size(); i++) {
-    for (int j = 0; j < tp_probe_vec[i].size(); j++) {
-      // sum-up all threads' tp
-      if (tp_time_figure.find(tp_probe_vec[i][j].ctr) == tp_time_figure.end()) {
-        tp_time_figure[tp_probe_vec[i][j].ctr] = tp_probe_vec[i][j].tp;
-      } else {
-        tp_time_figure[tp_probe_vec[i][j].ctr] += tp_probe_vec[i][j].tp;
-      }
-
-      if (attemp_tp_time_figure.find(tp_probe_vec[i][j].ctr) == attemp_tp_time_figure.end()) {
-        attemp_tp_time_figure[tp_probe_vec[i][j].ctr] = tp_probe_vec[i][j].attemp_tp;
-      } else {
-        attemp_tp_time_figure[tp_probe_vec[i][j].ctr] += tp_probe_vec[i][j].attemp_tp;
+  for (int i = 0; i < (int)tp_probe_vec.size(); i++) {
+    for (int j = 0; j < (int)tp_probe_vec[i].size(); j++) {
+      ProbeAgg& agg = tp_time_figure[tp_probe_vec[i][j].ctr];
+      agg.tp += tp_probe_vec[i][j].tp;
+      if (agg.t_ns == 0 || tp_probe_vec[i][j].t_ns < agg.t_ns) {
+        agg.t_ns = tp_probe_vec[i][j].t_ns;
       }
     }
   }
 
-  std::string config_filepath = "../../../config/cn_config.json";
-  auto json_config = JsonConfig::load_file(config_filepath);
-  auto client_conf = json_config.get("local_compute_node");
-  int tp_probe_interval_ms = (int)client_conf.get("tp_probe_interval_ms").get_int64();
-
-  int start_time = tp_time_figure.begin()->first;
-  auto iter = tp_time_figure.end();
-  iter--;
-  int end_time = iter->first;
-
-  for (int i = start_time; i <= end_time; i++) {
-    auto iter = tp_time_figure.find(i);
-    if (iter != tp_time_figure.end()) {
-      of_probe_tp << iter->first * tp_probe_interval_ms << " " << iter->second / 1000.0 << std::endl;
-    } else {
-      of_probe_tp << i << " " << 0 << std::endl;
-    }
+  of_probe_tp << "t_ns committed_ktps\n";
+  // Only ticks a worker actually recorded. Missing counters are the stall
+  // itself; repeating the previous timestamp with a zero hides that gap.
+  for (auto& item : tp_time_figure) {
+    of_probe_tp << item.second.t_ns << " " << item.second.tp / 1000.0 << "\n";
   }
-
   of_probe_tp.close();
+  std::cout << "TP_PROBE_FILE " << probe_file << std::endl;
 #endif
 }

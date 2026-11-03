@@ -5,9 +5,11 @@
 
 #include <atomic>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 #include "allocator/buffer_allocator.h"
 #include "connection/qp_manager.h"
@@ -24,9 +26,14 @@ using namespace std::placeholders;
 
 ///////////// For control and statistics ///////////////
 std::mutex mux;
+extern std::mutex tp_probe_mu;
 
 extern std::atomic<uint64_t> tx_id_generator;
 extern std::atomic<uint64_t> connected_t_num;
+
+static std::atomic<int> tpcc_workers{0};
+static std::atomic<int> tpcc_finished{0};
+static std::atomic<int> tpcc_check_done{0};
 extern std::atomic<uint64_t> connected_recovery_t_num;
 
 extern std::vector<t_id_t> tid_vec;
@@ -309,6 +316,7 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
 }
 
 void RunTPCC(coro_yield_t& yield, coro_id_t coro_id, int finished_num) {
+  tpcc_workers.fetch_add(1, std::memory_order_relaxed);
   // Each coroutine has a txn: Each coroutine is a coordinator
   TXN* txn = new TXN(meta_man,
                      qp_man,
@@ -387,6 +395,15 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id, int finished_num) {
       double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
       RecordTpLat(msr_sec);
 
+      const int done = tpcc_finished.fetch_add(1, std::memory_order_acq_rel) + 1;
+      if (done == tpcc_workers.load(std::memory_order_acquire)) {
+        CheckTpccConsistency(tpcc_client, yield, txn);
+        tpcc_check_done.store(1, std::memory_order_release);
+      } else {
+        while (tpcc_check_done.load(std::memory_order_acquire) == 0) {
+          usleep(1000);
+        }
+      }
       break;
     }
 
@@ -423,7 +440,13 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id, int finished_num) {
       tx_tput = (double)(stat_committed_tx_total - last_stat_committed_tx_total) / msr_sec;
       last_stat_committed_tx_total = stat_committed_tx_total;
 
-      tp_probe_list->emplace_back(TpProbe{.ctr = probe_times, .tp = tx_tput, .attemp_tp = attemp_tput});
+      timespec probe_ts{};
+      clock_gettime(CLOCK_REALTIME, &probe_ts);
+      uint64_t probe_ns = (uint64_t)probe_ts.tv_sec * 1000000000ull + (uint64_t)probe_ts.tv_nsec;
+      {
+        std::lock_guard<std::mutex> lock(tp_probe_mu);
+        tp_probe_list->emplace_back(TpProbe{.ctr = probe_times, .tp = tx_tput, .attemp_tp = attemp_tput, .t_ns = probe_ns});
+      }
 
       probe[thread_local_id] = false;
     }
